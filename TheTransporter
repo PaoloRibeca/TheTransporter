@@ -1,0 +1,1697 @@
+#!/bin/bash
+
+#
+# (C) 2018-2023 Paolo Ribeca, <paolo.ribeca@gmail.com>
+#  This script transports the annotation for a reference genome
+#   to another (hopefully close) genome
+#
+#  THIS SOFTWARE IS NOT YET READY FOR PUBLIC DISTRIBUTION.
+#  IT IS PROVIDED TO YOU AS IS, WITHOUT ANY WARRANTY,
+#   IN THE HOPE IT WILL BE USEFUL.
+#
+#  PLEASE DO NOT REDISTRIBUTE, AND CONTACT THE AUTHOR
+#   SHOULD YOU BE WILLING TO DO SO.
+#
+#  ONCE THE PROGRAM IS READY FOR DISTRIBUTION,
+#   THE FOLLOWING LICENSE WILL APPLY:
+#
+#  This program is free software: you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation, either version 3 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+
+# When we fail, we want to fail royally
+set -e
+
+# TODO:
+#  * Score !=0 when number of exons different from the starting one 
+#  * Add support for "escaped" "" in fields
+#  * Reject unsupported syntax for coordinates
+#  * Option to exclude features mapped to the opposite strand?
+
+VERSION="25"
+
+LEFT_ALIGNED_FEATURES="note|inference|experiment"
+GB_COLS=79
+
+REF=""
+IN=""
+TGT=""
+SIM="0."
+OUT_PREFIX=""
+FMT="gb"
+FMT_IN="gb"
+FMT_OUT="gb"
+TGT_CLA=""
+TGT_MOL=""
+TGT_TOPO=""
+TGT_DIV=""
+TGT_DATE=$(date | awk '{print $2"-"toupper($3)"-"$6}')
+TGT_DEF="" # Definition
+TGT_SOU="" # Informal description
+TGT_ORG="" # Scientific name
+TGT_LIN="" # Lineage
+TGT_TAX="" # Taxonomy ID
+TGT_STR="" # Strain
+TGT_KEY="."
+TGT_LOC=""
+TGT_ACC=""
+TGT_VER="1"
+TGT_GI=""
+TGT_LEN=0
+TRANSFORMATIONS=""
+THREADS=$(nproc)
+PRODUCTION=0
+KEEP_TEMPORARIES=""
+VERBOSE=""
+
+PID="$$"
+
+# Recurrent AWK functions
+AWK_library='
+  function abs(x) {
+    return (x<0?-x:x)
+  }
+  function min(a,b) {
+    return (a<=b?a:b)
+  }
+  function max(a,b) {
+    return (a>=b?a:b)
+  }
+  #
+  function get_value(key,list) {
+    # In case of multiple matches, it will return the _last_ one
+    return gensub("^.*,"key"=\"([^\"]*)\".*$","\\1",1,","list)
+  }
+  function set_value(key,value,list) {
+    return gensub("^,","",1,gensub(","key"=\"[^\"]*\"",","key"=\""value"\"","g",","list))
+  }
+  function copy_key(old,new,list) {
+    return gensub("^,","",1,gensub(","old"=\"([^\"]*)\"",","old"=\"\\1\","new"=\"\\1\"","g",","list))
+  }
+  function rename_key(old,new,list) {
+    return gensub("^,","",1,gensub(","old"=\"([^\"]*)\"",","new"=\"\\1\"","g",","list))
+  }
+  function delete_key(key,list) {
+    return gensub("^,","",1,gensub(","key"=\"[^\"]*\"","","g",","list))
+  }
+  #
+  function compute_metrics(feat,        x,s,l,res,i,ss) {
+    split(feat,x,":")
+    split(x[3],s,"+")
+    l=length(s)
+    res=""
+    for (i=1;i<=l;++i) {
+      split(s[i],ss,"-")
+      res=res (res==""?"":"+")(1+ss[2]-ss[1])
+    }
+    return res
+  }
+  function metrics_to_length(m,      s,l,res,i) {
+    split(m,s,"+")
+    l=length(s)
+    res=0
+    for (i=1;i<=l;++i)
+      res+=s[i];
+    return res
+  }
+  #
+  function blanks(n,   res,i) {
+    res=""
+    for (i=1;i<=n;++i)
+      res=res" ";
+    return res
+  }
+  function left_aligned_output(s,blks,cols,    ss,llen,line,res,ii,ext) {
+    s=gensub("[ ]+"," ","g",s)
+    split(s,ss," ")
+    llen=length(ss)
+    line=""
+    res=""
+    ### The invariant is that length(line)<cols ###
+    for (ii=1;ii<=llen;++ii) {
+      ext=line (line==""?"":" ")ss[ii] # Space between two words - not at the beginning of the line though
+      if (length(ext)>=cols) {
+        # We always print something
+        if (line!="") { ### && length(line)<cols ###
+          res=res blks line"\n"
+          line=ss[ii]
+        } else {
+          # Here we have to split the word
+          while (length(ext)>=cols) {
+            res=res blks substr(ext,1,cols)"\n"
+            ext=substr(ext,cols+1)
+          }
+          line=ext
+        }
+      } else
+        line=ext;
+    }
+    # Append what is left ### length(line) < cols ###
+    res=res blks line"\n"
+    return res
+  }
+'
+
+# This filter puts all multiline strings back on the same line.
+# Needs the GenBank column width as argument
+function genbank_prefilter {
+  awk -v COLS="$GB_COLS" '
+    function parse_error() {
+      print "Malformed GenBank file"
+      exit 1
+    }
+    #
+    {
+      switch (state) {
+        case 0:
+          # Before header
+          if ($0~"^LOCUS       ") {
+            printf "LOCUS       "gensub("[ \t][ \t][ \t]+","  ","g",substr($0,13))
+            state=1
+          }
+          break
+        case 1:
+          # Within header
+          if ($0~"^            ") {
+            # Multi-line metadata
+            printf " "substr($0,13)
+          } else if ($0~"^  ORGANISM") {
+            # Sadly, ORGANISM is special
+            printf "\n"$0
+            state=2
+          } else if ($0~"^FEATURES") {
+            print "\n"$0
+            state=3
+          } else if ($0~"^[^ \t]") {
+            # Major feature
+            printf "\n"$0
+          } else if ($0~"^ ") {
+            # Minor feature - for some obnoxious reason, sometimes the name is misaligned
+            printf("\n  %- 10s%s",gensub("^[ \t]+","",1,gensub("[ \t]+$","",1,substr($0,1,12))),substr($0,13))
+          }
+          break
+        case 2:
+          # Occult LINEAGE after ORGANISM (optional)
+          if ($0~"^            ") {
+            printf "\n  LINEAGE   "substr($0,13)
+            state=1
+          } else if ($0~"^FEATURES") {
+            print "\n"$0
+            state=3
+          } else
+            parse_error();
+          break
+        case 4:
+          # Location
+          if ($0~"^                     [^/]") {
+            # Multi-line location, wow
+            printf $0
+            break
+          } else {
+            # OK - the location was single-line after all
+            printf "\n"
+            state=3
+          }
+        case 3:
+          # Within features
+          if ($0~"^ORIGIN") {
+            print
+            state=6
+          } else if ($0~"^     [^ \t]") {
+            # Location
+            printf $0
+            state=4
+          } else if ($0~"^                     /([^=]+)=\"([^\"]+)$") {
+            # Multi-line (quoted) feature.
+            # If the row is shorter than COLS, the feature is a comment and we have to add a space
+            printf substr($0" ",1,COLS)
+            state=5
+          } else if ($0~"^                     /([^=]+)=\"([^\"]+)\"[ \t]*$") {
+            # Single-line quoted feature
+            print $0
+          } else if ($0~"^                     /([^=]+)=([^\"]+)$") {
+            # Single-line unquoted feature - we quote it to be regular, but prepending the name with "/"
+            print gensub("^                     /([^=]+)=([^\"]+)$","                     //\\1=\"\\2\"",1)
+          } else if ($0~"^                     /([^=]+)$") {
+            # Single-line feature without a value - we add the empty value
+            print $0"=\"\""
+          } else
+            parse_error();
+          break
+        case 5:
+          # Multi-line (quoted) feature
+          if ($0~"^                     ([^\"]*)\"$") {
+            printf gensub("^                     ([^\"]*)\"$","\\1",1)"\"\n"
+            state=3
+          } else
+            # If the row is shorter than COLS, the feature is a comment and we have to add a space
+            printf gensub("^                     (.*)$","\\1",1,substr($0" ",1,COLS));
+          break
+        case 6:
+          # Sequence
+          print
+          break
+        default:
+          parse_error()
+      }
+    }
+  '
+}
+
+AWK_retriever='
+  function retriever_add_seq() {
+    if (retriever_tag!=""&&retriever_seq!="")
+      # The sequence is stored in forward direction and capitalised
+      retriever_table[retriever_tag]=toupper(retriever_seq);
+    return
+  }
+  #
+  function retriever_load(fasta,             line) {
+    # We only reload the file if that is necessary
+    if (fasta!=currrent_fasta) {
+      while (getline line < fasta) {
+        if (line~"^>") {
+          retriever_add_seq()
+          retriever_tag=substr(line,2)
+          retriever_seq=""
+        } else
+          retriever_seq=retriever_seq line
+      }
+      retriever_add_seq()
+      current_fasta=fasta
+    }
+    return
+  }
+  #
+  function retriever_get(seq,lo,hi) {
+    return substr(retriever_table[seq],lo,hi-lo+1)
+  }
+  #
+  BEGIN {
+    __retriever_rc="RC"
+  }
+  # This function is the only one exported by the API
+  function retrieve_location(file,seq,str,loc,        s,len,res,i,ss) {
+    if (file=="")
+      file=seq".fasta"
+    # Nothing happens if the sequence has already been loaded
+    retriever_load(file)
+    # There might be "<"s or ">"s in the location, to signify incomplete features
+    split(gensub("[<>]","","g",loc),s,"+")
+    len=length(s)
+    res=""
+    for (i=1;i<=len;++i) {
+      split(s[i],ss,"-")
+      res=res retriever_get(seq,ss[1],ss[2])
+    }
+    if (str=="-") {
+      print res |& __retriever_rc
+      __retriever_rc |& getline res
+    }
+    return res
+  }
+'
+
+function wsplign {
+  local QUERY=$(realpath "$1")
+  local TARGET=$(realpath "$2")
+  local THREADS="$3"
+  if [[ "$THREADS" == "" ]]; then
+    THREADS="3"
+  fi
+  local OUT_DIR=$(mktemp -d -p .)
+  if [[ "$OUT_DIR" != "" ]]; then
+    rm -rf "$OUT_DIR"/*
+    cd "$OUT_DIR"
+    mkdir fasta
+    cat "$QUERY" | FASTools | awk -F '\t' 'BEGIN{names="QUERY.names"; fasta="./fasta/QUERY.fasta"; printf "" > names; printf "" > fasta} {print $1 >> names; print ">"(++cntr)"\n"$2 >> fasta}'
+    cp "$TARGET" fasta/TARGET.fasta
+    splign -mklds fasta
+    cd fasta
+    makeblastdb -dbtype nucl -parse_seqids -in TARGET.fasta > /dev/null 2>&1
+    cd ..
+    blastn -task dc-megablast -dust no -evalue 10000 -db fasta/TARGET.fasta -query fasta/QUERY.fasta -num_threads "$THREADS" -outfmt 6 > HITS.dc-mblast &
+    blastn -task blastn-short -dust no -word_size 10 -db fasta/TARGET.fasta -query fasta/QUERY.fasta -num_threads "$THREADS" -outfmt 6 > HITS.short-blast &
+    blastn -dust no -word_size 10 -db fasta/TARGET.fasta -query fasta/QUERY.fasta -num_threads "$THREADS" -outfmt 6 > HITS.reg-blast &
+    wait
+    cat HITS.dc-mblast HITS.short-blast HITS.reg-blast | sort -k2,2 -k1,1 > HITS.blastn
+    splign -type mrna -disc -W 10 -ldsdir fasta -hits HITS.blastn | awk -F '\t' -v NAMES=QUERY.names -f <(
+      echo "$AWK_library"
+cat <<'_____'
+      function score(a1,a2,    va1,va2,len,res,i) {
+        split(a1,va1,"+")
+        split(a2,va2,"+")
+        len=length(va1)
+        if (length(va2)!=len) # Different number of exons/alignment blocks
+          return 0;
+        res=0
+        for (i=1;i<=len;++i)
+          res+=log(min(va1[i],va2[i])/max(va1[i],va2[i]));
+        return exp(res/len)
+      }
+      #
+      function output() {
+        if ($1$2!=current) {
+          if (current!="")
+            print orig"\t"aln_que"\t"trg":"str_trg":"res"\t"aln_trg"\t"score(aln_que,aln_trg);
+          return 1
+        } else
+          return 0
+      }
+      #
+      BEGIN {
+        while (getline line < NAMES) {
+          name[++cntr]=line
+        }
+        str["++"]="+"
+        str["--"]="+"
+        str["+-"]="-"
+        str["-+"]="-"
+      }
+      #
+      {
+        if ($0!="# END"&&$8!="-"&&$9!="-") {
+          if (output()) {
+            # Cut off "lcl|"
+            orig=name[gensub("(^[^\\|]*\\|)*","",1,$2)]
+            # Splign mangles sequence names, not sure the following one is a general enough solution
+            trg=gensub("\\|","","g",gensub("(^[^\\|]*\\|)*","",1,$3))
+            split(orig,s,":")
+            # Both the query and the reference might have been swapped
+            str_trg=str[($7>$6?"+":"-")($9>$8?"+":"-")]
+            # There could be "<"s or ">"s in the location, to signify incomplete features
+            split(gensub("[<>]","","g",s[3]),ss,"+")
+            len=length(ss)
+            aln_que=""
+            for (i=1;i<=len;++i) {
+              split(ss[i],sss,"-")
+              aln_que=aln_que (aln_que==""?"":"+")(abs(sss[1]-sss[2])+1)
+            }
+            aln_trg=abs($9-$8)+1
+            res=min($8,$9)"-"max($8,$9)
+            current=$1$2
+          } else {
+            # The original alignment is always w.r.t. the positive strand,
+            #  so what matters here is the orientation w.r.t. the query
+            aln_trg=($6>$7?(abs($9-$8)+1)"+"aln_trg:aln_trg"+"(abs($9-$8)+1))
+            # We want the exons to be sorted w.r.t. the positive strand,
+            #  so what matters here is the orientation w.r.t. the target genome
+            res=($8>$9?min($8,$9)"-"max($8,$9)"+"res:res"+"min($8,$9)"-"max($8,$9))
+          }
+        }
+      }
+      #
+      END {
+        output()
+      }
+_____
+    ) | awk -F '\t' '{print $3"\t"$4"\t"$1"\t"$2"\t"$5}'
+    cd ..
+    rm -rf "$OUT_DIR"
+  fi
+}
+
+function the_transporter_II {
+  local TARGET=$(realpath "$1")
+  local DB=$(realpath "$2")
+  local THREADS="$3"
+  if [[ "$THREADS" == "" ]]; then
+    THREADS=32
+  fi
+  #
+  # TODO: EXPORT THIS
+  #
+  local MIN_PEP_LEN=16 # Minimum length of ORF peptides used as baits
+  local MIN_ORF_LEN=60 # Minimum length of products of de-novo ORFs
+  local MIN_NUCL_SIM=0.7
+  local MIN_PROT_SIM=0.4
+  local MIN_OVERL_THR=0.9 # Minimum length ratio to call containment 
+  #
+  local MAX_INTRON_LENGTH=500000
+  #
+  local OUT_DIR=$(mktemp -d -p .)
+  if [[ "$OUT_DIR" != "" ]]; then
+    rm -f "$OUT_DIR"/*
+    cd "$OUT_DIR"
+    # We copy and index the target, after sanitising the sequence name
+    cat "$TARGET" | FASTools | awk -F '\t' '{print ">"gensub("[^0-9A-Za-z_.#@%$~]","_","g",$1)"\n"$2}' > TARGET.fasta
+    makeblastdb -dbtype nucl -in TARGET.fasta -out TARGET > /dev/null 2>&1
+    # We extract CDS (both nucleotide and protein sequence) from the database of features
+    cat "$DB" | awk -F '\t' "$AWK_library"'
+      {
+        if ($4=="CDS"&&$5~"(^|^.+,)dna="&&$5~"(^|^.+,)translation=") {
+          nucl=get_value("dna",$5)
+          prot=get_value("translation",$5)
+          if (nucl!=""&&prot!="")
+            print ">"$1":"$2":"$3":"nucl":"prot"\n"prot > "CDS.prot.fasta";
+        }
+      }
+    '
+    if [ -s CDS.prot.fasta ]; then
+      # We index the CDS products
+      makeblastdb -dbtype prot -in CDS.prot.fasta -out CDS.prot > /dev/null 2>&1
+      # We generate candidates from sufficiently large ORF fragments
+      cat TARGET.fasta | transeq -frame 6 /dev/stdin /dev/stdout 2> /dev/null | FASTools | awk -F '\t' -v MIN_PEP_LEN="$MIN_PEP_LEN" '{split($2,s,"[*]+"); l=length(s); for (i=1;i<=l;++i) if (length(s[i])>=MIN_PEP_LEN) print ">"$1"_"i"\n"s[i]}' | blastp -seg no -word_size 2 -evalue 100 -db CDS.prot -query /dev/stdin -num_threads "$THREADS" -outfmt "6 qseqid qlen qstart qend sallseqid slen sstart send pident evalue bitscore" | awk -F '\t' '{if (($4-$3)>0.4*$2) print $5}' | sort | uniq | awk -F ':' 'BEGIN{nucl="CANDIDATES.nucl.fasta"; prot="CANDIDATES.prot.fasta"; printf "" > nucl; printf "" > prot} {print ">"$1":"$2":"$3"\n"$4 >> nucl; print ">"$1":"$2":"$3"\n"$5 >> prot}'
+      # We run splign on the DNA candidates
+      wsplign CANDIDATES.nucl.fasta TARGET.fasta "$THREADS" | awk -F '\t' -v MIN_NUCL_SIM="$MIN_NUCL_SIM" -f <(echo "$AWK_library"'{len_new=metrics_to_length($2); len_old=metrics_to_length($4); if (abs(len_old-len_new)/max(len_old,len_new)<(1.-MIN_NUCL_SIM)&&$5>=MIN_NUCL_SIM) print "SPLIGN\t"$0}') > CANDIDATES.splign &
+      # We run tblast on the protein candidates, and process its output
+      tblastn -db TARGET -query CANDIDATES.prot.fasta -seg no -word_size 2 -max_intron_length "$MAX_INTRON_LENGTH" -num_threads "$THREADS" -outfmt "6 qseqid qlen qstart qend sallseqid slen sstart send pident evalue bitscore" | awk -F '\t' -v MAX_INTRON_LENGTH="$MAX_INTRON_LENGTH" -v MIN_NUCL_SIM="$MIN_NUCL_SIM" -v MIN_PROT_SIM="$MIN_PROT_SIM" 'function abs(x){return x<0?-x:x} {split($1,s,":"); split(s[3],ss,"+"); l=length(ss); min=MAX_INTRON_LENGTH; for (i=1;i<=l;++i) {split(ss[i],sss,"-"); dist=abs(sss[2]-sss[1])+1; min=(dist<min?dist:min)} if (abs($8-$7)>=MIN_NUCL_SIM*min&&$9>=100.*MIN_PROT_SIM) print $0"\t"($8>=$7?"+\t"$7"\t"$8:"-\t"$8"\t"$7)"\t["min"]"}' | sort -k12,12 -k13,13g -k14,14g | awk -F '\t' 'BEGIN{sort="sort -k11,11gr -k9,9gr"} function print_group(group,        line){if (group!="") {printf group |& sort; close(sort,"to"); sort |& getline line; close(sort); print line} return} BEGIN{group=""} {if ($12!=str||$13>hi) {print_group(group); group=$0"\n"; str=$12; lo=$13; hi=$14} else {group=group $0"\n"; if ($14>hi) hi=$14}  ">>>"$0"\n<<<===\n"group"===>>>["str","lo","hi"]"  } END{print_group(group)}' | sort -k1,1 -k12,12 -k7,7n -k8,8n | awk -F '\t' 'BEGIN{group=""} {if ($1!=current||$12!=strand) {if (group!="") printf group; current=$1; strand=$12; score=$10; group=$0"\n"} else {if ($10==score) group=group $0"\n"}} END{if (current!="") printf group}' | awk -F '\t' 'BEGIN {res=""} {if ($1!=current||$12!=strand) {if (res!="") print $5":"strand":"res"\t"current"\t"((sim+0.)/len/100.); current=$1; strand=$12; res=$13"-"$14; len=1+$14-$13; sim=$9*(1+$14-$13)} else {res=res (res==""?"":"+")$13"-"$14; len+=(1+$14-$13); sim+=$9*(1+$14-$13)}} END{if (res!="") print $5":"strand":"res"\t"current"\t"((sim+0.)/len/100.)}' | awk -F '\t' -f <(echo "$AWK_library"'{print $1"\t"compute_metrics($1)"\t"$2"\t"compute_metrics($2)"\t"$3}') | awk -F '\t' -v MIN_NUCL_SIM="$MIN_NUCL_SIM" -v MIN_PROT_SIM="$MIN_PROT_SIM" -f <(echo "$AWK_library"'{len_new=metrics_to_length($2); len_old=metrics_to_length($4); if (abs(len_old-len_new)/max(len_old,len_new)<(1.-MIN_NUCL_SIM)&&$5>=MIN_PROT_SIM) print "TBLASTN\t"$0}') > CANDIDATES.tblastn &
+      # We generate, and search for, ORFs
+      (cat TARGET.fasta | transeq -frame 6 -alternative Y /dev/stdin /dev/stdout 2> /dev/null | FASTools | awk -F '\t' -v MIN_ORF_LEN="$MIN_ORF_LEN" 'function find_start_offset(s){return length(gensub("^([^M]*).*$","\\1",1,s))} function process_orf(orf,idx,name,seq_len,frame,      offs,ok){offs=find_start_offset(orf); ok=substr(orf,1+offs); ok=gensub("X$","",1,ok); if (length(ok)>=MIN_ORF_LEN) {  ">>>"(idx+offs)","seq_len","frame","length(ok)"<<<"substr($2,idx+offs,length(ok));  if (frame>3) {hi=seq_len-(frame-1)%3-3*(idx+offs-1); lo=hi+1-3*length(ok)} else {lo=1+(frame-1)%3+3*(idx+offs-1); hi=lo+3*length(ok)-1} print ">"name":"(frame>3?"-":"+")":"lo"-"hi"\n"ok >> "CANDIDATES.orfs.fasta"; print "ORFS\t"name":"(frame>3?"-":"+")":"lo"-"hi"\t"3*length(ok)"\t\t\t" >> "CANDIDATES.orfs"} return} BEGIN{printf "" > "CANDIDATES.orfs.fasta"; printf "" > "CANDIDATES.orfs"; while ("cat TARGET.fasta | FASTools" |& getline) t[$1]=length($2)} {split(gensub("^(.+)_([1-6])$","\\1\t\\2",1,$1),x,"\t"); seq_len=t[x[1]]; frame=x[2]; split($2,s,"[*]+",seps); l=length(s); if (l>0) {idx=1; process_orf(s[1],idx,x[1],seq_len,x[2]); for (i=2;i<=l;++i) {idx+=length(s[i-1])+length(seps[i-1]); process_orf(s[i],idx,x[1],seq_len,x[2])}}}'; cat CANDIDATES.orfs.fasta | blastp -seg no -word_size 2 -evalue 100 -db CDS.prot -query /dev/stdin -num_threads "$THREADS" -outfmt "6 qseqid qlen qstart qend sallseqid slen sstart send pident evalue bitscore" | awk -F '\t' '{if (($4-$3)/$2>0.4&&($8-$7)/$6>0.4&&$9>40) print}' | sort -t$'\t' -k1,1 -k11,11gr | awk -F '\t' '{if ($1!=curr_feature) {curr_feature=$1; curr_best_score=$11; print} else {if ($11==curr_best_score) print}}' | awk -F '\t' -f <(echo "$AWK_library"'{split($5,s,":"); loc=s[1]":"s[2]":"s[3]; print "BLASTP\t"$1"\t"compute_metrics($1)"\t"loc"\t"compute_metrics(loc)"\t"($9/100.)}') > CANDIDATES.blastp) &
+      wait
+      # We sort and uniquify results
+      cat CANDIDATES.splign CANDIDATES.tblastn CANDIDATES.blastp CANDIDATES.orfs | awk -F '\t' -f <(echo "$AWK_library"'BEGIN{prio["SPLIGN"]=1; prio["TBLASTN"]=2; prio["BLASTP"]=3; prio["ORFS"]=4} {split($2,s,":"); split(s[3],ss,"[+-]"); print $0"\t"s[2]"\t"ss[1]"\t"ss[length(ss)]"\t"prio[$1]"\t"metrics_to_length($3)}') | sort -t$'\t' -k7,7 -k8,8n -k9,9n | awk -F '\t' '{split($2,s,":"); print s[1]"\t"s[2]"\t"s[3]"\t"$0}' |
+      awk -F '\t' -v TARGET_LEN="$(cat TARGET.fasta | FASTools | awk -F '\t' '{print length($2)}')" -v TARGET="$TARGET" "$AWK_library $AWK_retriever"'
+        BEGIN {
+          transeq="transeq -frame F /dev/stdin /dev/stdout 2> /dev/null | FASTools | awk -F \047\\t\047 \047{print $2}\047"
+          delete translation
+        }
+        #
+        function get_translation(s,     frame_1,frame_2,frame_3) {
+          close(transeq)
+          print ">Query\n"s |& transeq
+          close(transeq,"to")
+          transeq |& getline frame_1
+          transeq |& getline frame_2
+          transeq |& getline frame_3
+          close(transeq)
+          delete translation
+          translation[1]=frame_1
+          translation[2]=frame_2
+          translation[3]=frame_3
+          return
+        }
+        #
+        BEGIN {
+          OFS="\t"
+          rc="RC"
+        }
+        # Internal helper subroutine to avoid code duplication
+        function __process_cds() {
+          #
+          res_hi=i
+          res_lo=res_hi-length(res)+1
+          dna_res_lo=3*(res_lo-1)+frame
+          dna_res_hi=3*(res_hi-1)+frame+2
+          overlap=(min(dna_res_hi,frame_hi)-max(dna_res_lo,frame_lo)+1)/(frame_hi-frame_lo+1)
+          if (overlap<0)
+            overlap=0;
+          orfs=orfs frame"\t"dna_res_lo"\t"dna_res_hi"\t"substr(ext_seq,dna_res_lo,dna_res_hi-dna_res_lo+1)"\t"(dna_res_hi-dna_res_lo+1)"\t"overlap"\t"res_lo"\t"res_hi"\t"substr(prot,res_lo,res_hi-res_lo+1)"\n"
+          ###
+          if (VERBOSE!="")
+            printf "==>{F"frame":"res_lo":"res_hi"=\047"res"\047=\047"substr(prot,res_lo,res_hi-res_lo+1)"\047="dna_res_lo":"dna_res_hi"=\047"substr(ext_seq,dna_res_lo,dna_res_hi-dna_res_lo+1)"\047,overlap="overlap"}" > "/dev/stderr";
+          ###
+        }
+        #
+        {
+          # In all cases, we retrieve the sequence relative to the positive strand
+          seq=retrieve_location("TARGET.fasta",$1,"+",$3)
+          split($3,metrics,"[+-]")
+          # Due to splicing, coordinates are relative *to ext_seq*, not to the reference
+          lo=metrics[1]
+          abs_lo=lo
+          hi=metrics[1]+length(seq)-1
+          abs_hi=metrics[length(metrics)]
+          ext_seq=(abs_lo>1?retrieve_location("TARGET.fasta",$1,"+","1-"(abs_lo-1)):"")seq (abs_hi<TARGET_LEN?retrieve_location("TARGET.fasta",$1,"+",(abs_hi+1)"-"TARGET_LEN):"")
+          nucl_len=length(ext_seq)
+          if ($2=="-") {
+            print ext_seq |& rc
+            rc |& getline ext_seq
+            # We have to swap (relative) lo and hi in this case
+            old_lo=lo
+            old_hi=hi
+            lo=nucl_len-old_hi+1
+            hi=nucl_len-old_lo+1
+          }
+          get_translation(ext_seq)
+          actual_frame=1+(lo-1)%3
+          ###
+          if (VERBOSE!="")
+            printf "(*) "$1":"$2":"$3 > "/dev/stderr";
+          ###
+          orfs=""
+          for (frame=1;frame<=3;++frame) {
+            prot=translation[frame]
+            prot_len=length(prot)
+            prot_lo=1+int((lo-frame)/3)
+            prot_hi=1+int((hi-frame)/3)
+            orf_lo=prot_lo
+            while (orf_lo>1&&substr(prot,orf_lo,1)!="*")
+              --orf_lo;
+            orf_hi=prot_hi
+            while (orf_hi<prot_len&&substr(prot,orf_hi,1)!="*")
+              ++orf_hi;
+            dna_orf_lo=3*(orf_lo-1)+frame
+            frame_lo=3*(prot_lo-1)+frame
+            frame_hi=3*(prot_hi-1)+frame+2
+            dna_orf_hi=3*(orf_hi-1)+frame+2
+            ###
+            if (VERBOSE!="")
+              printf ","(frame==actual_frame?"(==>)":"")"F"frame":"orf_lo"-"orf_hi":\""substr(prot,orf_lo,prot_lo-orf_lo)"["substr(prot,prot_lo,prot_hi-prot_lo+1)"]"substr(prot,prot_hi+1,orf_hi-prot_hi)"\",dna=\""substr(ext_seq,dna_orf_lo,frame_lo-dna_orf_lo)"["substr(ext_seq,frame_lo,frame_hi-frame_lo+1)"]"substr(ext_seq,frame_hi+1,dna_orf_hi-frame_hi)"\"" > "/dev/stderr";
+            ###
+            # For each interval between stop codons, we bracket the largest interval M...*
+            state=0
+            res=""
+            for (i=orf_lo;i<=orf_hi;++i) {
+              aa=substr(prot,i,1)
+              switch (aa) {
+                case "*":
+                  if (state==1) {
+                    # We include the final stop codon, as that seems to be customary
+                    res=res aa
+                    # End of CDS
+                    __process_cds()
+                    res=""
+                    state=0
+                  }
+                  break
+                case "M":
+                  if (state==0) {
+                    # Beginning of CDS
+                    state=1
+                  }
+                default:
+                  if (state==1)
+                    res=res aa;
+                  break
+              }
+            }
+            # We do not really want incomplete features without a final stop codon
+            #if (res!="") {
+            #  # End of ORF
+            #  __process_cds()
+            #}
+          }
+          ###
+          if (VERBOSE!="")
+            printf "\n" > "/dev/stderr";
+          ###
+          if (orfs!="") {
+            # We get the best ORF, i.e. the one
+            #  (1) that has the best overlap with the region originally identified by the method
+            #  (2) that is longest
+            sort="sort -t$\047\t\047 -k6,6gr -k5,5gr -k2,2n -k3,3n -k1,1"
+            print orfs |& sort
+            close(sort,"to")
+            sort |& getline line
+            close(sort)
+            split(line,s,"\t")
+            # The only thing left to do is to reconstruct the location
+            offs_lo=s[2]
+            if ($2=="-")
+              offs_lo=length(ext_seq)-s[3]+1;
+            offs_lo-=1 # It is a real offset
+            metrics[1]=1
+            metrics[length(metrics)]=TARGET_LEN
+            ptr=2
+            coord_lo=metrics[1]
+            to_do=offs_lo
+            while (to_do>0) {
+              ###
+              if (VERBOSE!="")
+                print "< to_do="to_do", ptr="ptr", metrics[ptr]="metrics[ptr]", coord_lo="coord_lo > "/dev/stderr";
+              ###
+              int_len=metrics[ptr]-coord_lo+1
+              if (int_len>to_do) {
+                coord_lo+=to_do
+                break
+              }
+              to_do-=int_len
+              ptr+=2
+              coord_lo=metrics[ptr-1]
+            }
+            loc=""
+            to_do=length(s[4])
+            while (to_do>0) {
+              ###
+              if (VERBOSE!="")
+                print "> to_do="to_do", ptr="ptr", metrics[ptr]="metrics[ptr]", coord_lo="coord_lo", loc="loc > "/dev/stderr";
+              ###
+              int_len=metrics[ptr]-coord_lo+1
+              if (int_len>=to_do) {
+                loc=loc (loc!=""?"+":"")coord_lo"-"(coord_lo+to_do-1)
+                break
+              }
+              loc=loc (loc!=""?"+":"")coord_lo"-"metrics[ptr]
+              to_do-=int_len
+              ptr+=2
+              coord_lo=metrics[ptr-1]
+            }
+            # We check that the sequence at the recomputed location is the same as the one we started with
+            if (s[4]!=retrieve_location("TARGET.fasta",$1,$2,loc)) {
+              print "Huston, we have a problem (\047"s[4]"\047!=\047"retrieve_location("TARGET.fasta",$1,$2,loc)"\047)"
+              exit 1
+            }
+            # We annotate the feature with its overlap, did_frame_change flag, DNA and protein sequence
+            printf $1":"$2":"loc"\t"(s[6]+0.)"\t"(s[1]!=actual_frame?"1":"0")"\t"gensub("[*]$","",1,s[9])"\t"s[4]
+            for (i=4;i<=NF;++i)
+              printf "\t"$i;
+            printf "\n"
+          } 
+          # As there is no well-formed ORF, we drop the CDS
+        }
+      ' | awk -F '\t' "$AWK_library"'
+        function get_lowest_pos(feat) {
+          return gensub("^[^:]+:[^:]+:([^-]+).*$","\\1",1,feat)
+        }
+        {
+          print $0"\t"metrics_to_length(compute_metrics($1))"\t"metrics_to_length(compute_metrics($9))"\t"abs(get_lowest_pos($1)-get_lowest_pos($9))
+        }
+      ' > CANDIDATES.merged
+      cat CANDIDATES.merged | awk -F '\t' '
+        {
+          split($1,s,":")
+          where=s[1]":"s[2]
+          l=split(s[3],ss,"+")
+          for (i=1;i<=l;++i) {
+            split(ss[i],sss,"-")
+            print where"\t"sss[1]"\t(\t"NR"\n"where"\t"(sss[2]+1)"\t)\t"NR
+          }
+        }
+      ' | sort -k1,1 -k2,2n | awk -F '\t' '
+        BEGIN {
+          current=""
+        }
+        {
+          key=$1"\t"$2
+          if (key!=current) {
+            if (current!="")
+              print res;
+            res=$0
+            current=key
+          } else
+            res=res "\t"$3"\t"$4;
+        }
+        END {
+          if (current!="")
+            print res;
+        }
+      ' | awk -F '\t' -v MIN_OVERL_THR="$MIN_OVERL_THR" '
+        {
+          # If the input file is formatted correctly, we do not need to check for sequence changes
+          for (i in open)
+            for (j in open)
+              m[i"\t"j]+=($2-old);
+          old=$2
+          for (i=3;i<NF;i+=2)
+            switch ($i) {
+              case "(":
+                open[$(i+1)]
+                break
+              case ")":
+                delete open[$(i+1)]
+            }
+        }
+        #
+        END {
+          for (i in m) {
+            split(i,s,"\t")
+            # We have to delay normalization of the diagonal, as the values are needed for the rest of the matrix
+            if (s[1]!=s[2]) {
+              printf "Normalizing "s[1]" < "s[2]": "m[i]" / "(m[s[1]"\t"s[1]]+0.)" = " > "CANDIDATES.groups.log"
+              m[i]/=(m[s[1]"\t"s[1]]+0.)
+              printf m[i] > "CANDIDATES.groups.log"
+              if (m[i]<MIN_OVERL_THR) {
+                delete m[i]
+                printf " (eliminated)" > "CANDIDATES.groups.log"
+              } else {
+                m[i]=1
+                printf " -> "m[i] > "CANDIDATES.groups.log"
+              }
+              print "" > "CANDIDATES.groups.log"
+            } else
+              p[i];
+          }
+          print "" > "CANDIDATES.groups.log"
+          for (i in p) {
+            m[i]=1
+            split(i,s,"\t")
+            print "Setting "s[1]" <> "s[2]" to 1" > "CANDIDATES.groups.log"
+          }
+          print "" > "CANDIDATES.groups.log"
+          # If a feature is contained in at least another one, we eliminate it
+          for (i in m) {
+            split(i,s,"\t")
+            if (!(s[2]"\t"s[1] in m)) {
+              d[s[1]]
+              print s[1]" < "s[2]", eliminating" > "CANDIDATES.groups.log"
+            }
+          }
+          for (i in m) {
+            split(i,s,"\t")
+            if (s[1] in d||s[2] in d)
+              delete m[i];
+          }
+          print "" > "CANDIDATES.groups.log"
+          for (i in m) {
+            print i
+            print i > "CANDIDATES.groups.log"
+          }
+        }
+      ' | Octopus | awk -F '\t' '
+        BEGIN {
+          while (getline line < "CANDIDATES.merged")
+            t[++cntr]=line;
+          # Whenever there are equivalent features, we sort them by:
+          #  (1) Decreasing size on target genome
+          #  (2) Decreasing size on source genome
+          #  (3) Lowest "distance" between feature on target and source genome
+          #  (4) Interval location in source genome
+          #  (5) Name of source genome.
+          sort="sort -t$\047\\t\047 -k17,17nr -k18,18nr -k19,19n -k15,15n -k16,16nr -k9,9"
+        }
+        #
+        function process_group(group,        line,t,s,ss,ok) {
+          if (group!="") {
+            printf group |& sort
+            close(sort,"to")
+            sort |& getline line
+            print line
+            print line > "CANDIDATES.groups"
+            # # This would keep the best feature per sequence
+            # split(line,s,"\t")
+            # delete t
+            # if (s[9]!="")
+            #   t[s[9]];
+            # split(s[9],ss,":")
+            # ok=ss[1]
+            # while (sort |& getline line) {
+            #   split(line,s,"\t")
+            #   split(s[9],ss,":")
+            #   if (ok!=""&&ss[1]==ok&&s[9]!=""&&(!(s[9] in t))) {
+            #     print line
+            #     t[s[9]]
+            #   }
+            # }
+            while (sort |& getline line)
+              print line > "CANDIDATES.groups";
+            print "" > "CANDIDATES.groups"
+            close(sort)
+          }
+          return
+        }
+        #
+        {
+          group=""
+          for (i=1;i<=NF;++i)
+            group=group t[$i]"\n";
+          process_group(group)
+        }
+      ' | sort -t$'\t' -k13,13n -k14,14n -k12,12 | awk -F '\t' '{print $7"\t"$8"\t"$9"\t"$10"\t"$11"\t"$6"\t"$1"\t"$2"\t"$3"\t"$4"\t"$5}' > CANDIDATES.res
+      # We select features that have been transported
+      cat "$DB" | awk -F '\t' 'BEGIN{while (getline < "CANDIDATES.res") {if ($3!="") t[$3]}} {if ($1":"$2":"$3 in t) print}' > CANDIDATES.txt
+      # We convert results to internal format
+      cat CANDIDATES.res | awk -F '\t' -v MIN_ORF_LEN="$MIN_ORF_LEN" -v TARGET_SEQ="$(cat TARGET.fasta | FASTools | awk -F '\t' '{print $1}')" -v TARGET_LEN="$(cat TARGET.fasta | FASTools | awk -F '\t' '{print length($2)}')" "$AWK_library $AWK_retriever"'
+        function get_support(loc,    s,ss) {
+          split(loc,s,":")
+          split(s[3],ss,"[+-]")
+          return s[1]":"s[2]":"ss[1]"-"ss[length(ss)]
+        }
+        #
+        BEGIN {
+          while (getline < "CANDIDATES.txt") {
+            key=$1":"$2":"$3;
+            payl=$4"\t"$5;
+            if (key in t)
+              t[key]=t[key]"\n"payl;
+            else
+              t[key]=payl
+          }
+          method["SPLIGN"]="RNA->DNA"
+          method["TBLASTN"]="protein->DNA"
+          method["BLASTP"]="protein->ORF"
+        }
+        # We:
+        #  (1) eliminate sequence annotations where they are not in CDSs, and rename them when they are
+        #  (2) make sure that each CDS has a corresponding gene feature
+        #  (3) apply possible location changes for features and CDSs
+        #  (4) tag disrupted genes/pseudogenes
+        #  (5) optionally remove DNA sequences from CDSs
+        {
+          if ($3 in t) {
+            split(t[$3],s,"\n");
+            len=length(s);
+            for (i=1;i<=len;++i) {
+              split(s[i],ss,"\t");
+              if (ss[1]=="CDS") {
+                ss[2]=rename_key("dna","dna_orig",rename_key("translation","transl_orig",ss[2]))
+                # We annotate the feature with its DNA and protein sequence
+                ss[2]=ss[2]",dna=\""$11"\",translation=\""gensub("[*]$","",1,$10)"\""
+                if (DEBUG=="")
+                  ss[2]=delete_key("transl_orig",delete_key("dna",delete_key("dna_orig",ss[2])));
+              } else {
+                if (ss[1]=="gene")
+                  genes[$1];
+                ss[2]=delete_key("dna",ss[2])
+              }
+              score=(ss[1]=="CDS"?$8:$5)
+              # Annotations that work for all features
+              if (ss[2]~"(^|^.+,)note=")
+                ss[2]=gensub("(^|^.+,)note=\"([^\"]*)\"(.*)$","\\1note=\"\\2; transported from "$3" (method="method[$6]", similarity="$5")\"\\3","g",ss[2])",method=\"TheTransporter."$6"\",score=\""score"\"";
+              else
+                ss[2]=ss[2](ss[2]==""?"":",")"note=\"transported from "$3" (method="method[$6]", similarity="$5")\",method=\"TheTransporter."$6"\",score=\""score"\"";
+              if (ss[1]=="CDS") {
+                if (!($1 in genes))
+                  # We copy the first CDS "note" field over to the gene
+                  features[++cntr]=$1"\tgene\t"gensub("(^|^.+,)(note=\"[^\"]*\").*$","\\2",1,ss[2]);
+                # Annotations specific to CDSs
+                if ($9=="1")
+                  ss[2]=gensub("(^|^.+,)note=\"([^\"]+)\\)\"(.*)$","\\1note=\"\\2; unexpected frame)\"\\3","g",ss[2]);
+                overlap=$8
+                if (overlap<0.4&&length(get_value("translation",ss[2]))<MIN_ORF_LEN)
+                  # We mark the location as a pseudogene
+                  ss[2]=gensub("(^|^.+,)note=\"([^\"]+)\\)\"(.*)$","\\1note=\"\\2; disrupted frame, overlap="overlap")\",pseudo=\"true\"\\3","g",ss[2]);
+                else if (overlap<0.9)
+                  ss[2]=gensub("(^|^.+,)note=\"([^\"]+)\\)\"(.*)$","\\1note=\"\\2; partial frame, overlap="overlap")\"\\3","g",ss[2]);
+                else if (overlap>1.)
+                  ss[2]=gensub("(^|^.+,)note=\"([^\"]+)\\)\"(.*)$","\\1note=\"\\2; extended frame, overlap="overlap")\"\\3","g",ss[2]);
+                features[++cntr]=$7"\t"ss[1]"\t"ss[2]
+                # If the location has changed, we might also want to change other features corresponding to the CDS
+                if (overlap>=0.9)
+                  mappings[$1]=get_support($7);
+                else {
+                  supp_old=get_support($1)
+                  supp_new=get_support($7)
+                  split(gensub("^([^:]+):([^:]+):([^-]+)-(.*)$","\\1\t\\2\t\\3\t\\4",1,supp_old),so,"\t")
+                  split(gensub("^([^:]+):([^:]+):([^-]+)-(.*)$","\\1\t\\2\t\\3\t\\4",1,supp_new),sn,"\t")
+                  mappings[$1]=so[1]"\t"so[2]"\t"min(so[3],sn[3])"-"max(so[4],sn[4])
+                }
+              } else
+                features[++cntr]=$1"\t"ss[1]"\t"ss[2];
+            }
+          } else {
+            features[++cntr]=get_support($7)"\tgene\tproduct=\"putative\",note=\"putative ORF\",method=\"TheTransporter.ORF\",score=\"0\""
+            if (DEBUG=="")
+              features[++cntr]=$7"\tCDS\tproduct=\"putative\",note=\"putative ORF\",translation=\""gensub("[*]$","",1,$10)"\",method=\"TheTransporter.ORF\",score=\"0\"";
+            else
+              features[++cntr]=$7"\tCDS\tdna=\""$11"\",product=\"putative\",note=\"putative ORF\",translation=\""gensub("[*]$","",1,$10)"\",method=\"TheTransporter.ORF\",score=\"0\"";
+          }
+        }
+        #
+        END {
+          # We emit the header
+          #print "##VIRUS"
+          #print "#LOCUS=\""TARGET_SEQ"\""
+          #print "#DEFINITION=\""TARGET_SEQ"\""
+          #print "#SOURCE=\""TARGET_SEQ"\""
+          #print "#ORGANISM=\""TARGET_SEQ"\""
+          #print "=GENE_ENUMERATE locus_tag "TARGET_SEQ"- 1 "TARGET_LEN" | GENE_ENUMERATE gene "TARGET_SEQ"- 1 "TARGET_LEN
+          #print TARGET_SEQ"\t+\t1-"TARGET_LEN"\tsource\torganism=\""TARGET_SEQ"\",mol_type=\"genomic DNA\",strain=\"unspecified\",db_xref=\".\""
+          # We emit the features
+          l=length(features)
+          for (i=1;i<=l;++i) {
+            split(features[i],s,"\t")
+            if (s[2]!="CDS"&&(s[1] in mappings))
+              print gensub(":","\t","g",mappings[s[1]])"\t"s[2]"\t"s[3];
+            else
+              print gensub(":","\t","g",s[1])"\t"s[2]"\t"s[3];
+          }
+          # We emit the footer
+          print "<\"/dev/stdout\""
+        }
+      '
+    fi
+    cd ..
+    #rm -rf "$OUT_DIR"
+  fi
+}
+
+function genbank_2_features {
+  genbank_prefilter | awk '
+    {
+      if ($0~"^LOCUS[ \t]+([^ \t]+).*$")
+        seq=gensub("^LOCUS[ \t]+([^ \t]+).*$","\\1",1);
+      if ($0~"^FEATURES.*$")
+        state=1;
+      if ($0~"^ORIGIN.*$")
+        state=0;
+      # This regexp does not capture the possibility that the location might be split
+      #  into more than just one line - but in principle that should be fine thanks to the filter
+      if (state==1&&$0~"^     ([^ ]+)[ ]+(.+)$") {
+        if (printed>0) {
+          printf "\n"
+          printed=0
+        }
+        split(gensub("^     ([^ ]+)[ ]+(.+)$","\\1\t\\2",1),s,"\t")
+        what=s[1]
+        if (s[2]~"^complement\\((.+)\\)$") {
+          where=gensub("^complement\\((.+)\\)$","\\1",1,s[2])
+          str="-"
+        } else {
+          where=s[2]
+          str="+"
+        }
+        # We do not support order, which by the way does not mean anything well-defined
+        where=gensub("^order","join",1,where)
+        # We also do not support between-nucleotides locations
+        where=gensub("[\\^]","+",1,where)
+        where=gensub("^join\\((.+)\\)$","\\1",1,where)
+        where=gensub(",","+","g",where)
+        where=gensub("\\.\\.","-","g",where)
+        # There might be "<"s or ">"s in the location, to signify incomplete features
+        where=gensub("[<>]","","g",where)
+        printf("%s",seq"\t"str"\t"where"\t"what"\t")
+        printed=1
+        attrs=0
+      }
+      if (state==1&&what!=""&&$0~"^[ \t]+/([^=]+)=\"([^\"]*)\"$") {
+        split(gensub("^[ \t]+/([^=]+)=\"([^\"]*)\"$","\\1\t\\2",1),s,"\t")
+        printf("%s",(attrs>0?",":"")gensub("=","~","g",s[1])"=\""gensub("\"","\047","g",s[2])"\"")
+        ++attrs
+      }
+    }
+    #
+    END {
+      if (printed>0)
+        printf "\n"
+    }
+  ' | awk -F '\t' '{if ($4!="source") print}'
+}
+
+function internal_add_sequence {
+  awk -F '\t' -v REGEXP="$1" "$AWK_retriever"'
+    {
+      if ($4~REGEXP)
+        print $1"\t"$2"\t"$3"\t"$4"\t"$5($5==""?"":",")"dna=\""retrieve_location("",$1,$2,$3)"\""
+    }
+    ' | awk -F '\t' "$AWK_library"'
+    BEGIN {
+      OFS="\t"
+    }
+    #
+    {
+      transeq="transeq /dev/stdin /dev/stdout 2> /dev/null | FASTools"
+      print get_value("dna",$5) |& transeq
+      close(transeq,"to")
+      transeq |& getline line
+      close(transeq)
+      split(line,s,"\t")
+      prot=gensub("*$","",1,s[2])
+      if ($5~"(^|,)translation=") {
+        orig=get_value("translation",$5)
+        if (prot!=orig) {
+          print "ERROR: Mismatch between annotated protein \047"orig"\047 and translated protein \047"prot"\047, changing to translated" > "/dev/stderr"
+          $5=set_value("translation",prot)
+        }
+      } else
+        $5=$5",translation=\""prot"\"";
+      print
+    }
+  '
+}
+
+function metadata_2_genbank {
+awk -v COLS="$GB_COLS" -v LEN="$TGT_LEN" -v LOC="$TGT_LOC" -v CLA="$TGT_CLA" -v TOPO="$TGT_TOPO" -v DIV="$TGT_DIV" -v DATE="$TGT_DATE" -v DEF="$TGT_DEF" -v ACC="$TGT_ACC" -v VER="$TGT_VER" -v GI="$TGT_GI" -v KEY="$TGT_KEY" -v SOU="$TGT_SOU" -v ORG="$TGT_ORG" -v LIN="$TGT_LIN" "$AWK_library"'
+  BEGIN {
+    print "LOCUS       "LOC"  "LEN" bp  "CLA"  "TOPO"  "DIV"  "DATE
+    print "DEFINITION  "DEF
+    print "ACCESSION   "ACC
+    print "VERSION     "ACC"."VER (GI!=""?"  "GI:"")
+    print "KEYWORDS    "KEY
+    print "SOURCE      "SOU
+    print "  ORGANISM  "ORG
+    printf("%s",left_aligned_output(LIN,blanks(12),max(1,COLS-12)))
+  }
+'
+}
+function metadata_2_gff3 {
+  awk -v VERSION="$VERSION" -v VERSION_SPLIGN="$(splign -help | awk 'BEGIN{state=0} {if (state==1) {print $2; state=2} if (state==0&&$0~"^DESCRIPTION") state=1}')" -v VERSION_BLAST=$(blastn -help | awk 'BEGIN{state=0} {if (state==1) {print $3; state=2} if (state==0&&$0~"^DESCRIPTION") state=1}') -v LEN="$TGT_LEN" -v LOC="$TGT_LOC" -v CLA="$TGT_CLA" -v TOPO="$TGT_TOPO" -v DIV="$TGT_DIV" -v DATE="$TGT_DATE" -v DEF="$TGT_DEF" -v ACC="$TGT_ACC" -v VER="$TGT_VER" -v GI="$TGT_GI" -v KEY="$TGT_KEY" -v SOU="$TGT_SOU" -v ORG="$TGT_ORG" -v LIN="$TGT_LIN" "$AWK_library"'
+    BEGIN {
+      print "#gff-version 3"
+      print "##source-version TheTransporter "VERSION
+      print "##source-version BLAST "VERSION_BLAST
+      print "##source-version Splign "VERSION_SPLIGN
+      print "##sequence-region "ACC" 1 "LEN
+    }
+  '
+}
+
+function features_2_genbank {
+  awk -F '\t' -v LEFT_ALIGNED_FEATURES="$LEFT_ALIGNED_FEATURES" -v COLS="$GB_COLS" "$AWK_library"'
+    BEGIN {
+      cols=max(1,COLS-21)
+      print "FEATURES             Location/Qualifiers"
+    }
+    #
+    {
+      loc=gensub("+",",","g",gensub("-","..","g",$3))
+      if (loc~",")
+        loc="join("loc")";
+      if ($2=="-")
+        loc="complement("loc")";
+      print "     "$4 blanks(max(1,16-length($4)))loc
+      # We can split at `",` because we are sure that each value is always double quoted.
+      # However, while doing so, we eliminate the trailing `"` from each value
+      # We eliminate some features that are not meant for GenBank
+      features=delete_key("method",delete_key("score",$5))
+      n=split(substr(features,1,length(features)-1),s,"\",")
+      for (i=1;i<=n;++i) {
+        rem="/"s[i]"\""
+        # The feature can be empty
+        if (rem~"=\"\"$")
+          rem=substr(rem,1,length(rem)-3);
+        # The feature might have been originally unquoted
+        if (rem~"^//")
+          rem=gensub("^//([^=]+)=\"([^\"]+)\"$","/\\1=\\2",1,rem);
+        if (s[i]~"^("LEFT_ALIGNED_FEATURES")=")
+          printf("%s",left_aligned_output(rem,blanks(21),cols));
+        else {
+          while (length(rem)>cols) {
+            print "                     "substr(rem,1,cols)
+            rem=substr(rem,cols+1)
+          }
+          if (length(rem)>0)
+            print "                     "rem;
+        }
+      }
+    }
+  '
+}
+function features_2_gff3 {
+  awk '{if ($0!~"^[#=<>%]"&&$4!="source") print}' | awk -F '\t' -v ACC="$TGT_ACC" "$AWK_library"'
+    {
+      
+      ### TODO    
+      ### TODO
+      ### TODO
+
+      l=split($3,s,"-")
+      if ($3~"+"||l!=2) {
+        print "ERROR: Not yet implemented" > "/dev/stderr"
+        exit 1
+      }
+
+      lo=s[1]
+      hi=s[2]
+      method=get_value("method",$5)
+      if (method=="")
+        method=".";
+      score=get_value("score",$5)
+      if (score=="")
+        score=".";
+      list=rename_key("locus_tag","ID",rename_key("label","Name",rename_key("note","Note",delete_key("translation",delete_key("method",delete_key("score",$5))))))
+      # Remove "//" signaling that the feature had been originally unquoted
+      list=gensub("\",/","\",","g",gensub("^/","",1,list))
+      if ($4=="CDS") {
+        # We assume there exists a "gene" feature with the same name
+        ID=get_value("ID",list)
+        list=set_value("ID",ID"_CDS",list)",Parent="ID"_exon"
+        # GFF3-specific mangling ### TODO - NOT GENERAL? We do not replace "=" with "%3D" within fields, for instance
+        list=gensub("&","%26","g",gensub(",","%2C","g",gensub("\"","","g",gensub("\",",";","g",gensub(";","%3B","g",list)))))
+        ### TODO - NOT GENERAL
+        list=gensub("\"","","g",gensub("\",/","\",","g",gensub("^/","",1,list)))
+        print ACC"\t"method"\tmRNA\t"lo"\t"hi"\t"score"\t"$2"\t.\tID="ID"_mRNA;Parent="ID
+        print ACC"\t"method"\texon\t"lo"\t"hi"\t"score"\t"$2"\t.\tID="ID"_exon;Parent="ID"_mRNA"
+        print ACC"\t"method"\tCDS\t"lo"\t"hi"\t"score"\t"$2"\t0\t"list
+      } else {
+        # GFF3-specific mangling ### TODO - NOT GENERAL? We do not replace "=" with "%3D" within fields, for instance
+        list=gensub("&","%26","g",gensub(",","%2C","g",gensub("\"","","g",gensub("\",",";","g",gensub(";","%3B","g",list)))))
+        print ACC"\t"method"\t"$4"\t"lo"\t"hi"\t"score"\t"$2"\t.\t"list
+      }
+    }
+  '
+}
+
+function genbank_2_sequence {
+  awk '
+    {
+      if (NR==1)
+        print ">"$2;
+      else {
+        if (state==1) {
+          if ($0~"^//")
+            state=0;
+          else
+            print gensub("[ 0-9]","","g")
+        }
+        if ($0~"^ORIGIN")
+          state=1
+      }
+    }
+  '
+}
+
+function sequence_2_genbank {
+  awk -F '\t' "$AWK_library"'
+    {
+      if ($0~"^>") {
+        if (state==1)
+          state=0;
+        else
+          state=1
+      } else if (state==1) {
+        seq=seq $0
+      }
+    }
+    #
+    END {
+      print "ORIGIN";
+      len=length(seq);
+      for (i=0;i<len;i+=10) {
+        if (i%60==0) {
+          if (i>0)
+            printf "\n";
+          printf("%10d",i+1)
+        }
+        printf(" %s",substr(seq,i+1,min(10,len-i)))
+      }
+      print "\n//\n"
+    }
+  '
+}
+function sequence_2_gff3 {
+  awk '
+    BEGIN {
+      print "##FASTA"
+    }
+    #
+    {
+      print
+    }
+  '
+}
+function usage {
+cat << _____
+Syntax:
+  $(basename $0)
+    [--gb | --gtf | --gff3]
+      specifies input/output format
+        for subsequent annotation file(s),
+        can be given more than once,
+        for instance
+          ... --gb -a input.gb --gff3 -o output.gff3 ...
+        (default: gb)
+    -a <GenBank_file|GTF_file|GFF3_file>
+      annotation for reference genome
+        (mandatory)
+    [-r <FASTA_file>]
+      reference genome
+        (mandatory if format is not GenBank)
+    [-f <zero_or_more_text_features>]
+      where
+        <zero_or_more_text_features> :=
+          "" | <one_or_more_text_features>
+        <one_or_more_text_features> :=
+          <text_feature> [ | <one_or_more_text_features> ]
+      specifies that GenBank features with corresponding names
+        should be treated as (possibly multi-line) text
+        (default: ${LEFT_ALIGNED_FEATURES})
+    -t <FASTA_file>
+      target genome
+        (mandatory)
+    [-s <fraction>]
+      minimum similarity score for a feature to be kept
+        (default=${SIM})
+    [-N <standard_names_tag>,<standard_names_prefix>]
+      add/replace "/"<standard_names_tag> annotations
+        with new ones of the form
+          <standard_names_prefix>-###
+        where ### are increasing numbers
+        and the features are sorted by position
+        irrespective of their strand.
+      When present, old annotations are kept with name
+        "/"<standard_names_tag>"_orig".
+      If multiple -N/-C/-R/-D transformations are specified,
+        they are executed in the order specified
+    [-C <source_tag>,<destination_tag>]
+      copy features named <source_tag>
+        to features named <destination_tag>.
+      If multiple -N/-C/-R/-D transformations are specified,
+        they are executed in the order specified
+    [-R <source_tag>,<destination_tag>]
+      rename features named <source_tag>
+        to features named <destination_tag>.
+      If multiple -N/-C/-R/-D transformations are specified,
+        they are executed in the order specified
+    [-D <tag>]
+      remove features named <tag>.
+      If multiple -N/-C/-R/-D transformations are specified,
+        they are executed in the order specified
+    -o <output_prefix>
+      annotation for target genome will be named
+        <output_prefix>.[gb|gtf|gff3]
+      depending on the selected format
+        (mandatory)
+    [-m <property>=<value> ]
+      sets metadata <property> to <value>
+        (known properties are:
+          "class", "molecule", "topography", "division",
+          "date", "definition", "source", "organism",
+          "lineage", "taxonomy_id", "strain", "keywords",
+          "locus", "accession", "version", "gi_number")
+    [-p|--production]
+      do not emit "/transl_orig" and "/dna" annotation
+        used to check correctness of CDS features
+    [-T <threads>]
+      computing threads
+        (default=${THREADS})
+    [-k|--keep-temporaries]
+      do not erase temporary files
+        (default=erase)
+    [-h|--help]
+      print this syntax and exit.    
+_____
+}
+
+function add_unary_transformation {
+  TRANSFORMATIONS=$(echo "$2" | awk -v OP="$1" -v OPS="$TRANSFORMATIONS" -F ',' 'END{print (NF==1&&$0!~"\t"?OPS (OPS==""?"":"\t\t")OP"\t"$1"\t":"")}')
+  if [[ "$TRANSFORMATIONS" == "" ]]; then
+    usage
+    echo "Invalid argument '$2' to option '$1'"
+    exit 1
+  fi
+}
+function add_binary_transformation {
+  TRANSFORMATIONS=$(echo "$2" | awk -v OP="$1" -v OPS="$TRANSFORMATIONS" -F ',' 'END{print (NF==2&&$0!~"\t"?OPS (OPS==""?"":"\t\t")OP"\t"$1"\t"$2:"")}')
+  if [[ "$TRANSFORMATIONS" == "" ]]; then
+    usage
+    echo "Invalid argument '$2' to option '$1'"
+    exit 1
+  fi
+}
+
+echo "This is TheTransporter (version $VERSION)"
+echo " (c) 2018-2023 Paolo Ribeca, <paolo.ribeca@gmail.com>"
+
+# Parse command line options
+
+OPTS=$(getopt -o a:r:f:t:s:N:C:R:D:o:m:pT:kh --long gb,gtf,gff3,production,keep-temporaries,help -- "$@")
+
+# Check the result of parsing options was correct
+
+if [ $? != 0 ] ; then
+  usage
+  echo "Invalid parameters found on the command line";
+  exit 1
+fi
+
+#echo "$OPTS"
+eval set -- "$OPTS"
+
+while true; do
+  case "$1" in
+    -r )
+      REF="$2"
+      shift
+      ;;
+    -a )
+      IN="$2"
+      FMT_IN="$FMT"
+      shift
+      ;;
+    -f )
+      LEFT_ALIGNED_FEATURES="$2"
+      shift
+      ;;
+    -t )
+      TGT="$2"
+      shift
+      ;;
+    -s )
+      SIM=$(echo "$2" | awk '{print ($0<0||$0>1?"'"$SIM"'":$0)}')
+      shift
+      ;;
+    -N )
+      add_binary_transformation "N" "$2"
+      shift
+      ;;
+    -C )
+      add_binary_transformation "C" "$2"
+      shift
+      ;;
+    -R )
+      add_binary_transformation "R" "$2"
+      shift
+      ;;
+    -D )
+      add_unary_transformation "D" "$2"
+      shift
+      ;;
+    -o )
+      OUT_PREFIX="$2"
+      FMT_OUT="$FMT"
+      OUT="${OUT_PREFIX}.${FMT_OUT}"
+      shift
+      ;;
+    -m )
+      KEY="$(echo "$2" | awk '{split($0,s,"="); print s[1]}')"
+      VALUE="$(echo "$2" | awk '{split($0,s,"="); print substr($0,length(s[1])+2)}')"
+      case "$KEY" in
+        class )
+          TGT_CLA="$VALUE"
+          ;;
+        molecule )
+          TGT_MOL="$VALUE"
+          ;;
+        topography )
+          TGT_TOPO="$VALUE"
+          ;;
+        division )
+          TGT_DIV="$VALUE"
+          ;;
+        date )
+          TGT_DATE"$VALUE"
+          ;;
+        definition )
+          TGT_DEF="$VALUE"
+          ;;
+        source )
+          TGT_SOU="$VALUE"
+          ;;
+        organism )
+          TGT_ORG="$VALUE"
+          ;;
+        lineage )
+          TGT_LIN="$VALUE"
+          ;;
+        taxonomy_id )
+          TGT_TAX="$VALUE"
+          ;;
+        strain )
+          TGT_STR="$VALUE"
+          ;;
+        keywords )
+          TGT_KEY="$VALUE"
+          ;;
+        locus )
+          TGT_LOC="$VALUE"
+          ;;
+        accession )
+          TGT_ACC="$VALUE"
+          ;;
+        version )
+          TGT_VER="$VALUE"
+          ;;
+        gi_number )
+          TGT_GI="$VALUE"
+          ;;
+        * )
+          usage
+          echo "Unknown argument '$KEY' to option -m"
+          exit 1
+          ;;
+      esac;
+      shift
+      ;;
+    --gb )
+      FMT="gb"
+      ;;
+    --gtf )
+      FMT="gtf"
+      ;;
+    --gff3 )
+      FMT="gff3"
+      ;;
+    -p | --production )
+      PRODUCTION=1
+      ;;
+    -T )
+      THREADS=$(echo "$2" | awk '{t=int($0); print (t<1?"'"$THREADS"'":$0)}')
+      shift
+      ;;
+    -k | --keep-temporaries )
+      KEEP_TEMPORARIES="--keep-temporaries"
+      ;;
+    -h | -help | --help )
+      usage
+      exit 0
+      ;;
+    -- )
+      ;;
+    * )
+      if [ "$1" == "" ]; then
+        break
+      else
+        usage
+        echo "Found invalid option '$1'"
+        exit 1
+      fi
+      ;;
+  esac;
+  shift
+done
+
+# Checks on mandatory parameters
+
+if [[ ( ( "$FMT_IN" != "gb" ) && ( "$REF" == "" ) ) || "$IN" == "" || "$TGT" == "" || "$OUT_PREFIX" == "" ]]; then
+  usage
+  echo "Mandatory parameter(s) missing on the command line";
+  exit 1
+fi
+
+# Create temporary directory
+TMP_DIR="$(mktemp -d -p . TheTransporter.XXXXXXXXXX)"
+TMP_DIR="${PWD}/$(echo "$TMP_DIR" | awk '{if ($0~"./") print substr($0,3)}')"
+TMP_PREFIX="${TMP_DIR}/TheTransporter"
+
+# Convert input annotation to internal form, de-Window$-ise input files
+
+case "$FMT_IN" in
+  gb )
+    REF_LOC=$(cat "$IN" | awk '{if (NR==1) {print $2; exit 0}}')
+    cat "$IN" | sed 's/\r$//' | genbank_2_sequence > "$TMP_DIR/$REF_LOC".fasta
+    cat "$IN" | sed 's/\r$//' | genbank_2_features | (
+      cd "$TMP_DIR"
+      internal_add_sequence "."
+    ) > "$TMP_PREFIX".int
+    cat "$TGT" | sed 's/\r$//' > "$TMP_PREFIX".tgt.fa
+    ;;
+  gtf )
+    #cat "$REF" | sed 's/\r$//' > "$TMP_PREFIX".ref.fa
+    echo "Input annotation in GTF format not yet implemented, sorry"
+    #cat "$TGT" | sed 's/\r$//' > "$TMP_PREFIX".tgt.fa
+    exit 1
+    ;;
+  gff3 )
+    #cat "$REF" | sed 's/\r$//' > "$TMP_PREFIX".ref.fa
+    echo "Input annotation in GFF3 format not yet implemented, sorry"
+    #cat "$TGT" | sed 's/\r$//' > "$TMP_PREFIX".tgt.fa
+    exit 1
+    ;;
+esac
+
+OLD_IFS="$IFS"
+IFS=$'\t'
+read -r TGT_NAME TGT_LEN <<<$(
+  cat "$TMP_PREFIX".tgt.fa | FASTools | awk -F '\t' '{ print gensub("[ \t]+","_","g",$1)"\t"length($2) }'
+) || exit 1
+#  If the input annotation has GenBank format, we read metadata from it
+case "$FMT_IN" in
+  gb )
+    read -r REF_CLA REF_TOPO REF_DIV REF_ORG REF_ACC REF_LIN REF_MOL REF_TAX <<<$(
+      cat "$IN" | sed 's/\r$//' |
+      genbank_prefilter | awk '
+        {
+          switch (state) {
+            case 0:
+              if ($0~"^LOCUS       ") {
+                cla=$5
+                topo=$6
+                div=$7
+              }
+              if ($0~"^ACCESSION   ")
+                acc=substr($0,13);
+              if ($0~"^  ORGANISM  ")
+                org=substr($0,13);
+              if ($0~"^  LINEAGE   ")
+                lin=substr($0,13);
+              if ($0~"^FEATURES             ")
+                state=1;
+              break
+            case 1:
+              if ($0~"^     source          ")
+                state=2;
+              break
+            case 2:
+              if ($0~"^                     /mol_type=") {
+                mol=substr($0,32)
+                if (substr(mol,1,1)=="\"")
+                  mol=substr(mol,2,length(mol)-2)
+              }
+              if ($0~"^                     /db_xref=") {
+                tax=substr($0,31)
+                if (substr(tax,1,1)=="\"")
+                  tax=substr(tax,2,length(tax)-2)
+              }
+              if ($0!~"^                     ")
+                state=3;
+              break
+            case 3:
+              break
+          }
+        }
+        #
+        END {
+          print cla"\t"topo"\t"div"\t"org"\t"acc"\t"lin"\t"mol"\t"tax
+        }
+      '
+    )
+    ;;
+  gtf )
+    ;;
+  gff3 )
+    ;;
+esac
+IFS="$OLD_IFS"
+
+# We set defaults whenever possible and reasonable
+
+if [[ "$TGT_CLA" == "" ]]; then
+  if [[ "$REF_CLA" != "" ]]; then
+    TGT_CLA="$REF_CLA"
+  else
+    TGT_CLA="DNA"
+  fi
+fi
+if [[ "$TGT_MOL" == "" ]]; then
+  if [[ "$REF_MOL" != "" ]]; then
+    TGT_MOL="$REF_MOL"
+  else
+    TGT_MOL="___MOL___"
+  fi
+fi
+if [[ "$TGT_TOPO" == "" ]]; then
+  if [[ "$REF_TOPO" != "" ]]; then
+    TGT_TOPO="$REF_TOPO"
+  else
+    TGT_TOPO="linear"
+  fi
+fi
+if [[ "$TGT_DIV" == "" ]]; then
+  if [[ "$REF_DIV" != "" ]]; then
+    TGT_DIV="$REF_DIV"
+  else
+    TGT_DIV="VIR"
+  fi
+fi
+if [[ "$TGT_DEF" == "" ]]; then
+  TGT_DEF="$TGT_NAME"
+fi
+if [[ "$TGT_SOU" == "" ]]; then
+  TGT_SOU="$TGT_NAME"
+fi
+if [[ "$TGT_ORG" == "" ]]; then
+  if [[ "$REF_ORG" != "" ]]; then
+    TGT_ORG="$REF_ORG"
+  else
+    TGT_ORG="___ORG___"
+  fi
+fi
+if [[ "$TGT_LIN" == "" ]]; then
+  if [[ "$REF_LIN" != "" ]]; then
+    TGT_LIN="$REF_LIN"
+  else
+    TGT_LIN="___LIN___"
+  fi
+fi
+if [[ "$TGT_TAX" == "" ]]; then
+  if [[ "$REF_TAX" != "" ]]; then
+    TGT_TAX="$REF_TAX"
+  else
+    TGT_TAX="___TAX___"
+  fi
+fi
+if [[ "$TGT_LOC" == "" ]]; then
+  TGT_LOC="___LOC___"
+fi
+if [[ "$TGT_ACC" == "" ]]; then
+  TGT_ACC="___ACC___"
+fi
+
+# Add source to annotations in internal form
+
+echo -e "$TGT_NAME\t+\t1-$TGT_LEN\tsource\torganism=\"$TGT_ORG\",mol_type=\"$TGT_MOL\",$(awk -v STR="$TGT_STR" 'BEGIN{ printf (STR==""?"":"\tstrain=\""STR"\",") }')db_xref=\"$TGT_TAX\"" > "$TMP_PREFIX".res
+
+# Run methods, parse their results and turn them into internal representation
+
+(
+  cd "$TMP_DIR"
+  the_transporter_II TheTransporter.tgt.fa TheTransporter.int >> TheTransporter.res
+)
+
+# Generate list of failed transports
+
+cat "$TMP_PREFIX".res | awk -v INIT="$TMP_PREFIX".int -F '\t' '
+  {
+    if ($5~"^.*transported from [^(]+ \\(method=[^,]+, similarity=[^)]+.*$") {
+      ann=gensub("^.*transported from ([^(]+) \\(method=[^,]+, similarity=([^;)]+)(.*)\\).*$","\\1\t\\2\t\\3",1,$5)
+      split(ann,s,"\t")
+      loc=s[1]
+      sco=s[2]
+      warn=(s[3]~"(unexpected|disrupted|partial|extended) frame"?gensub("^.*(unexpected|disrupted|partial|extended) frame.*$","\t\\1","g",s[3]):"")
+      tt[loc":"$4]=sco toupper(warn)
+    }
+  }
+  #
+  END {
+    while (getline < INIT)
+      t[$1":"$2":"$3":"$4];
+    for (i in tt)
+      delete t[i];
+    for (i in t) {
+      split(i,s,":")
+      split(s[3],ss,"-")
+      print ss[1]"\t"s[1]"\t"s[2]"\t"s[3]"\t"s[4]"\tFAILED\t"
+    }
+    for (i in tt) {
+      split(i,s,":")
+      split(s[3],ss,"-")
+      print ss[1]"\t"s[1]"\t"s[2]"\t"s[3]"\t"s[4]"\t"tt[i]
+    }
+  }
+' | sort -k2,2 -k1,1n -k3,3 | awk -F '\t' '{print $2"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7}' > "$TMP_PREFIX".sum
+
+# Converting internal representation to output format
+
+case "$FMT_OUT" in
+  gb )
+    metadata_2_genbank > "$OUT"
+    cat "$TMP_PREFIX".res | features_2_genbank >> "$OUT"
+    cat "$TMP_PREFIX".tgt.fa | sequence_2_genbank >> "$OUT"
+    ;;
+  gtf )
+    echo "Output annotation in GTF format not yet implemented, sorry"
+    exit 1
+    ;;
+  gff3 )
+    metadata_2_gff3 > "$OUT"
+    cat "$TMP_PREFIX".res | features_2_gff3 >> "$OUT"
+    cat "$TMP_PREFIX".tgt.fa | sequence_2_gff3 >> "$OUT"
+    ;;
+esac
+
+# Emit final summary
+
+cat "$TMP_PREFIX".sum | awk -F '\t' '
+  {
+    if ($5=="FAILED")
+      failed=failed"\t"$0"\n";
+    if ($6!="")
+      warnings=warnings"\t"$0"\n"
+  }
+  #
+  END {
+    n_failed=length(gensub("[^\n]","","g",failed))
+    n_warnings=length(gensub("[^\n]","","g",warnings))
+    printf "There were "NR" features in the original file.\n"
+    printf n_failed" could not be transported or were replaced"(n_failed>0?":\n"failed:".\n")
+    printf n_warnings" were damaged in transport"(n_warnings>0?":\n"warnings:".\n")
+  }
+'
+
+# Remove temporary directory
+
+if [[ "$KEEP_TEMPORARIES" == "" ]]; then
+  rm -rf "$TMP_DIR"
+fi
+
