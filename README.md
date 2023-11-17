@@ -11,7 +11,9 @@ Bug reports are always appreciated. Please send them to [paolo.ribeca@gmail.com]
 The Transporter depends on:
 * Standard UNIX toolchain utilities (`bash`, `AWK`, etc.)
 * A few programs from [BiOCamLib](https://github.com/PaoloRibeca/BiOCamLib). Installation instructions can be found there, but the process is usually very simple and you can just copy pre-compiled binaries across
-* Depending on the annotation method you'd like to use, external programs such as BLAST, Splign, ... In order to simplify installation of Splign, which is notoriously difficult, a pre-compiled static binary for Linux with no kernel dependecies is provided in directory [`Dependencies`](Dependencies).
+* Program `transeq` from the EMBOSS suite. EMBOSS can be installed through `conda` or compiled from scratch after downloading it from [here](https://emboss.sourceforge.net/download/). Compilation is straightforward (`./configure` and `make`)
+* Depending on the annotation method you'd like to use, external programs such as BLAST, Splign, ...
+Unfortunately, Splign is notoriously difficult to compile. In order to simplify installation, static binaries pre-compiled for Linux and independent of the kernel version are provided in directory [`Dependencies`](Dependencies) for Splign and all other dependencies.
 
 ## Examples of use
 
@@ -20,6 +22,7 @@ We use the files in the directory Test as examples.
 The basic command specifies as input an annotation and a FASTA file to be annotated:
 
 ```bash
-$ TheTransporter -t Test/ASFV_de_novo.fasta -a Test/ASFV_Cameroon_2016.gbk -o Test.I
+$ TheTransporter -t Test/ASFV_de_novo.fasta -a Test/ASFV_Cameroon_2016.gbk -o Test
 ```
+This will generate an output `Test.gb` in GenBank format (which is the default).
 
