@@ -665,7 +665,9 @@ function the_transporter_II {
           return gensub("^[^:]+:[^:]+:([^-]+).*$","\\1",1,feat)
         }
         {
-          print $0"\t"metrics_to_length(compute_metrics($1))"\t"metrics_to_length(compute_metrics($9))"\t"abs(get_lowest_pos($1)-get_lowest_pos($9))
+          len_tgt=metrics_to_length(compute_metrics($1))
+          len_src=metrics_to_length(compute_metrics($9))
+          print $0"\t"len_tgt"\t"len_src"\t"abs(get_lowest_pos($1)-get_lowest_pos($9))"\t"abs(len_tgt-len_src)
         }
       ' > CANDIDATES.merged
       cat CANDIDATES.merged | awk -F '\t' '
@@ -758,17 +760,17 @@ function the_transporter_II {
             print i > "CANDIDATES.groups.log"
           }
         }
-      ' | Octopus | awk -F '\t' '
+      ' | Octopus | tee CANDIDATES.octopus.txt | awk -F '\t' '
         BEGIN {
           while (getline line < "CANDIDATES.merged")
             t[++cntr]=line;
           # Whenever there are equivalent features, we sort them by:
           #  (1) Decreasing size on target genome
-          #  (2) Decreasing size on source genome
+          #  (2) Increasing size difference
           #  (3) Lowest "distance" between feature on target and source genome
           #  (4) Interval location in source genome
           #  (5) Name of source genome.
-          sort="sort -t$\047\\t\047 -k17,17nr -k18,18nr -k19,19n -k15,15n -k16,16nr -k9,9"
+          sort="sort -t$\047\\t\047 -k17,17nr -k20,20n -k19,19n -k15,15n -k16,16nr -k9,9"
         }
         #
         function process_group(group,        line,t,s,ss,ok) {
