@@ -14,7 +14,7 @@ The Transporter depends on:
 * Program `transeq` from the EMBOSS suite. EMBOSS can be installed through `conda` or compiled from scratch after downloading it from [here](https://emboss.sourceforge.net/download/). Compilation is straightforward (`./configure` and `make`)
 * Depending on the annotation method you'd like to use, external programs such as BLAST, Splign, ...
 
-Unfortunately, Splign is notoriously difficult to compile. In order to simplify installation, static binaries pre-compiled for Linux and independent of the kernel version are provided in directory [`Dependencies`](Dependencies) for Splign and all other dependencies.
+Unfortunately, Splign is notoriously difficult to compile. In order to simplify installation, static binaries pre-compiled for Linux and independent of the kernel version are provided in directory [`Dependencies`](Dependencies) for Splign and all other dependencies. Just copy them to some place in your PATH, and you won't need to install anything else.
 
 ## Examples of use
 
