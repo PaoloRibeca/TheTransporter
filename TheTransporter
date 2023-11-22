@@ -38,7 +38,7 @@ set -e
 #  * Reject unsupported syntax for coordinates
 #  * Option to exclude features mapped to the opposite strand?
 
-VERSION="26"
+VERSION="27"
 
 LEFT_ALIGNED_FEATURES="note|inference|experiment"
 GB_COLS=79
@@ -519,11 +519,141 @@ function the_transporter_II {
                 print ">"$1"_"i"\n"s[i];
           }
         }
-      ' | blastp -seg no -word_size 2 -evalue 100 -db CDS.prot -query /dev/stdin -num_threads "$THREADS" -outfmt "6 qseqid qlen qstart qend sallseqid slen sstart send pident evalue bitscore" | awk -F '\t' '{if (($4-$3)>0.4*$2) print $5}' | sort | uniq | awk -F ':' 'BEGIN{nucl="CANDIDATES.nucl.fasta"; prot="CANDIDATES.prot.fasta"; printf "" > nucl; printf "" > prot} {print ">"$1":"$2":"$3"\n"$4 >> nucl; print ">"$1":"$2":"$3"\n"$5 >> prot}'
+      ' | blastp -seg no -word_size 2 -evalue 100 -db CDS.prot -query /dev/stdin -num_threads "$THREADS" \
+                 -outfmt "6 qseqid qlen qstart qend sallseqid slen sstart send pident evalue bitscore" | awk -F '\t' '
+        {
+          if (($4-$3)>0.4*$2)
+            print $5;
+        }
+      ' | sort | uniq | awk -F ':' '
+        BEGIN {
+          nucl="CANDIDATES.nucl.fasta"
+          prot="CANDIDATES.prot.fasta"
+          printf "" > nucl
+          printf "" > prot
+        }
+        {
+          print ">"$1":"$2":"$3"\n"$4 >> nucl
+          print ">"$1":"$2":"$3"\n"$5 >> prot
+        }
+      '
       # We run splign on the DNA candidates
-      wsplign CANDIDATES.nucl.fasta TARGET.fasta "$THREADS" | awk -F '\t' -v MIN_NUCL_SIM="$MIN_NUCL_SIM" -f <(echo "$AWK_library"'{len_new=metrics_to_length($2); len_old=metrics_to_length($4); if (abs(len_old-len_new)/max(len_old,len_new)<(1.-MIN_NUCL_SIM)&&$5>=MIN_NUCL_SIM) print "SPLIGN\t"$0}') > CANDIDATES.splign &
+      wsplign CANDIDATES.nucl.fasta TARGET.fasta "$THREADS" | awk -F '\t' -v MIN_NUCL_SIM="$MIN_NUCL_SIM" "$AWK_library"'
+        {
+          len_new=metrics_to_length($2)
+          len_old=metrics_to_length($4)
+          if (abs(len_old-len_new)/max(len_old,len_new)<(1.-MIN_NUCL_SIM)&&$5>=MIN_NUCL_SIM)
+            print "SPLIGN\t"$0;
+        }
+      ' > CANDIDATES.splign &
       # We run tblast on the protein candidates, and process its output
-      tblastn -db TARGET -query CANDIDATES.prot.fasta -seg no -word_size 2 -max_intron_length "$MAX_INTRON_LENGTH" -num_threads "$THREADS" -outfmt "6 qseqid qlen qstart qend sallseqid slen sstart send pident evalue bitscore" | awk -F '\t' -v MAX_INTRON_LENGTH="$MAX_INTRON_LENGTH" -v MIN_NUCL_SIM="$MIN_NUCL_SIM" -v MIN_PROT_SIM="$MIN_PROT_SIM" 'function abs(x){return x<0?-x:x} {split($1,s,":"); split(s[3],ss,"+"); l=length(ss); min=MAX_INTRON_LENGTH; for (i=1;i<=l;++i) {split(ss[i],sss,"-"); dist=abs(sss[2]-sss[1])+1; min=(dist<min?dist:min)} if (abs($8-$7)>=MIN_NUCL_SIM*min&&$9>=100.*MIN_PROT_SIM) print $0"\t"($8>=$7?"+\t"$7"\t"$8:"-\t"$8"\t"$7)"\t["min"]"}' | sort -k12,12 -k13,13g -k14,14g | awk -F '\t' 'BEGIN{sort="sort -k11,11gr -k9,9gr"} function print_group(group,        line){if (group!="") {printf group |& sort; close(sort,"to"); sort |& getline line; close(sort); print line} return} BEGIN{group=""} {if ($12!=str||$13>hi) {print_group(group); group=$0"\n"; str=$12; lo=$13; hi=$14} else {group=group $0"\n"; if ($14>hi) hi=$14}  ">>>"$0"\n<<<===\n"group"===>>>["str","lo","hi"]"  } END{print_group(group)}' | sort -k1,1 -k12,12 -k7,7n -k8,8n | awk -F '\t' 'BEGIN{group=""} {if ($1!=current||$12!=strand) {if (group!="") printf group; current=$1; strand=$12; score=$10; group=$0"\n"} else {if ($10==score) group=group $0"\n"}} END{if (current!="") printf group}' | awk -F '\t' 'BEGIN {res=""} {if ($1!=current||$12!=strand) {if (res!="") print $5":"strand":"res"\t"current"\t"((sim+0.)/len/100.); current=$1; strand=$12; res=$13"-"$14; len=1+$14-$13; sim=$9*(1+$14-$13)} else {res=res (res==""?"":"+")$13"-"$14; len+=(1+$14-$13); sim+=$9*(1+$14-$13)}} END{if (res!="") print $5":"strand":"res"\t"current"\t"((sim+0.)/len/100.)}' | awk -F '\t' -f <(echo "$AWK_library"'{print $1"\t"compute_metrics($1)"\t"$2"\t"compute_metrics($2)"\t"$3}') | awk -F '\t' -v MIN_NUCL_SIM="$MIN_NUCL_SIM" -v MIN_PROT_SIM="$MIN_PROT_SIM" -f <(echo "$AWK_library"'{len_new=metrics_to_length($2); len_old=metrics_to_length($4); if (abs(len_old-len_new)/max(len_old,len_new)<(1.-MIN_NUCL_SIM)&&$5>=MIN_PROT_SIM) print "TBLASTN\t"$0}') > CANDIDATES.tblastn &
+      tblastn -db TARGET -query CANDIDATES.prot.fasta \
+              -seg no -word_size 2 -max_intron_length "$MAX_INTRON_LENGTH" -num_threads "$THREADS" \
+              -outfmt "6 qseqid qlen qstart qend sallseqid slen sstart send pident evalue bitscore" | \
+        awk -F '\t' -v MAX_INTRON_LENGTH="$MAX_INTRON_LENGTH" -v MIN_NUCL_SIM="$MIN_NUCL_SIM" -v MIN_PROT_SIM="$MIN_PROT_SIM" "$AWK_library"'
+          {
+            split($1,s,":")
+            split(s[3],ss,"+")
+            l=length(ss)
+            m=MAX_INTRON_LENGTH
+            for (i=1;i<=l;++i) {
+              split(ss[i],sss,"-")
+              dist=abs(sss[2]-sss[1])+1
+              m=min(m,dist)
+            }
+            if (abs($8-$7)>=MIN_NUCL_SIM*m&&$9>=100.*MIN_PROT_SIM)
+              print $0"\t"($8>=$7?"+\t"$7"\t"$8:"-\t"$8"\t"$7)"\t["m"]";
+          }
+      ' | sort -k12,12 -k13,13g -k14,14g | awk -F '\t' '
+        BEGIN {
+          sort="sort -k11,11gr -k9,9gr"
+        }
+        function print_group(group,   line) {
+          if (group!="") {
+            printf group |& sort
+            close(sort,"to")
+            sort |& getline line
+            close(sort)
+            print line
+          }
+          return
+        }
+        BEGIN {
+          group=""
+        }
+        {
+          if ($12!=str||$13>hi) {
+            print_group(group)
+            group=$0"\n"
+            str=$12
+            lo=$13
+            hi=$14
+          } else {
+            group=group $0"\n"
+            if ($14>hi)
+              hi=$14;
+          }
+          #print ">>>"$0"\n<<<===\n"group"===>>>["str","lo","hi"]"
+        }
+        END {
+          print_group(group)
+        }
+      ' | sort -k1,1 -k12,12 -k7,7n -k8,8n | awk -F '\t' '
+        BEGIN {
+          group=""
+        }
+        {
+          if ($1!=current||$12!=strand) {
+            if (group!="")
+              printf group;
+            current=$1
+            strand=$12
+            score=$10
+            group=$0"\n"
+          } else {
+            if ($10==score)
+              group=group $0"\n";
+          }
+        }
+        END {
+          if (current!="")
+            printf group;
+        }
+      ' | awk -F '\t' '
+        BEGIN {
+          res=""
+        }
+        {
+          if ($1!=current||$12!=strand) {
+            if (res!="")
+              print $5":"strand":"res"\t"current"\t"((sim+0.)/len/100.);
+            current=$1
+            strand=$12
+            res=$13"-"$14
+            len=1+$14-$13
+            sim=$9*(1+$14-$13)
+          } else {
+            res=res (res==""?"":"+")$13"-"$14
+            len+=(1+$14-$13)
+            sim+=$9*(1+$14-$13)
+          }
+        }
+        END {
+          if (res!="")
+            print $5":"strand":"res"\t"current"\t"((sim+0.)/len/100.);
+        }
+      ' | awk -F '\t' "$AWK_library"'
+        {
+          print $1"\t"compute_metrics($1)"\t"$2"\t"compute_metrics($2)"\t"$3
+        }
+      ' | awk -F '\t' -v MIN_NUCL_SIM="$MIN_NUCL_SIM" -v MIN_PROT_SIM="$MIN_PROT_SIM" "$AWK_library"'
+        {
+          len_new=metrics_to_length($2)
+          len_old=metrics_to_length($4)
+          if (abs(len_old-len_new)/max(len_old,len_new)<(1.-MIN_NUCL_SIM)&&$5>=MIN_PROT_SIM)
+            print "TBLASTN\t"$0;
+        }
+      ' > CANDIDATES.tblastn &
       # We generate, and search for, ORFs
       (
         cat TARGET.fasta | FASTools | awk -F '\t' -v MIN_ORF_LEN="$MIN_ORF_LEN" "$AWK_transeq"'
@@ -569,12 +699,52 @@ function the_transporter_II {
             }
           }
         ';
-        cat CANDIDATES.orfs.fasta | blastp -seg no -word_size 2 -evalue 100 -db CDS.prot -query /dev/stdin -num_threads "$THREADS" -outfmt "6 qseqid qlen qstart qend sallseqid slen sstart send pident evalue bitscore" | awk -F '\t' '{if (($4-$3)/$2>0.4&&($8-$7)/$6>0.4&&$9>40) print}' | sort -t$'\t' -k1,1 -k11,11gr | awk -F '\t' '{if ($1!=curr_feature) {curr_feature=$1; curr_best_score=$11; print} else {if ($11==curr_best_score) print}}' | awk -F '\t' -f <(echo "$AWK_library"'{split($5,s,":"); loc=s[1]":"s[2]":"s[3]; print "BLASTP\t"$1"\t"compute_metrics($1)"\t"loc"\t"compute_metrics(loc)"\t"($9/100.)}') > CANDIDATES.blastp
+        cat CANDIDATES.orfs.fasta |
+          blastp -seg no -word_size 2 -evalue 100 -db CDS.prot -query /dev/stdin -num_threads "$THREADS" \
+                 -outfmt "6 qseqid qlen qstart qend sallseqid slen sstart send pident evalue bitscore" | awk -F '\t' '
+          {
+            if (($4-$3)/$2>0.4&&($8-$7)/$6>0.4&&$9>40)
+              print;
+          }
+        ' | sort -t"$(printf "\t")" -k1,1 -k11,11gr | awk -F '\t' '
+          {
+            if ($1!=curr_feature) {
+              curr_feature=$1
+              curr_best_score=$11
+              print
+            } else {
+              if ($11==curr_best_score)
+                print;
+            }
+          }' | awk -F '\t' "$AWK_library"'
+          {
+            split($5,s,":")
+            loc=s[1]":"s[2]":"s[3]
+            print "BLASTP\t"$1"\t"compute_metrics($1)"\t"loc"\t"compute_metrics(loc)"\t"($9/100.)
+          }
+        ' > CANDIDATES.blastp
       ) &
       wait
       # We sort and uniquify results
-      cat CANDIDATES.splign CANDIDATES.tblastn CANDIDATES.blastp CANDIDATES.orfs | awk -F '\t' -f <(echo "$AWK_library"'BEGIN{prio["SPLIGN"]=1; prio["TBLASTN"]=2; prio["BLASTP"]=3; prio["ORFS"]=4} {split($2,s,":"); split(s[3],ss,"[+-]"); print $0"\t"s[2]"\t"ss[1]"\t"ss[length(ss)]"\t"prio[$1]"\t"metrics_to_length($3)}') | sort -t$'\t' -k7,7 -k8,8n -k9,9n | awk -F '\t' '{split($2,s,":"); print s[1]"\t"s[2]"\t"s[3]"\t"$0}' |
-      awk -F '\t' -v TARGET_LEN="$(cat TARGET.fasta | FASTools | awk -F '\t' '{print length($2)}')" -v TARGET="$TARGET" "$AWK_library $AWK_retriever $AWK_transeq"'
+      cat CANDIDATES.splign CANDIDATES.tblastn CANDIDATES.blastp CANDIDATES.orfs | awk -F '\t' "$AWK_library"'
+        BEGIN {
+          prio["SPLIGN"]=1
+          prio["TBLASTN"]=2
+          prio["BLASTP"]=3
+          prio["ORFS"]=4
+        }
+        {
+          split($2,s,":")
+          split(s[3],ss,"[+-]")
+          print $0"\t"s[2]"\t"ss[1]"\t"ss[length(ss)]"\t"prio[$1]"\t"metrics_to_length($3)
+        }
+      ' | sort -t"$(printf "\t")" -k7,7 -k8,8n -k9,9n | awk -F '\t' '
+        {
+          split($2,s,":")
+          print s[1]"\t"s[2]"\t"s[3]"\t"$0
+        }
+      ' | awk -F '\t' -v TARGET_LEN="$(FASTools -f TARGET.fasta | awk -F '\t' '{print length($2)}')" \
+                      -v TARGET="$TARGET" "$AWK_library $AWK_retriever $AWK_transeq"'
         BEGIN {
           delete translation
         }
@@ -694,7 +864,7 @@ function the_transporter_II {
             # We get the best ORF, i.e. the one
             #  (1) that has the best overlap with the region originally identified by the method
             #  (2) that is longest
-            sort="sort -t$\047\t\047 -k6,6gr -k5,5gr -k2,2n -k3,3n -k1,1"
+            sort="sort -t\"$(printf \"\\t\")\" -k6,6gr -k5,5gr -k2,2n -k3,3n -k1,1"
             print orfs |& sort
             close(sort,"to")
             sort |& getline line
@@ -864,7 +1034,7 @@ function the_transporter_II {
           #  (3) Lowest "distance" between feature on target and source genome
           #  (4) Interval location in source genome
           #  (5) Name of source genome.
-          sort="sort -t$\047\\t\047 -k17,17nr -k20,20n -k19,19n -k15,15n -k16,16nr -k9,9"
+          sort="sort -t\"$(printf \"\\t\")\" -k17,17nr -k20,20n -k19,19n -k15,15n -k16,16nr -k9,9"
         }
         #
         function process_group(group,        line,t,s,ss,ok) {
@@ -903,7 +1073,11 @@ function the_transporter_II {
             group=group t[$i]"\n";
           process_group(group)
         }
-      ' | sort -t$'\t' -k13,13n -k14,14n -k12,12 | awk -F '\t' '{print $7"\t"$8"\t"$9"\t"$10"\t"$11"\t"$6"\t"$1"\t"$2"\t"$3"\t"$4"\t"$5}' > CANDIDATES.res
+      ' | sort -t"$(printf "\t")" -k13,13n -k14,14n -k12,12 | awk -F '\t' '
+        {
+          print $7"\t"$8"\t"$9"\t"$10"\t"$11"\t"$6"\t"$1"\t"$2"\t"$3"\t"$4"\t"$5
+        }
+      ' > CANDIDATES.res
       # We select features that have been transported
       cat "$DB" | awk -F '\t' 'BEGIN{while (getline < "CANDIDATES.res") {if ($3!="") t[$3]}} {if ($1":"$2":"$3 in t) print}' > CANDIDATES.txt
       # We convert results to internal format
