@@ -38,7 +38,7 @@ set -e
 #  * Reject unsupported syntax for coordinates
 #  * Option to exclude features mapped to the opposite strand?
 
-VERSION="25"
+VERSION="26"
 
 LEFT_ALIGNED_FEATURES="note|inference|experiment"
 GB_COLS=79
@@ -322,6 +322,54 @@ AWK_retriever='
   }
 '
 
+AWK_transeq='
+  BEGIN {
+    _T["GCA"]="A"; _T["GCC"]="A"; _T["GCG"]="A"; _T["GCT"]="A"; _T["GCN"]="A"; _T["GC"]="A"
+    _T["TGC"]="C"; _T["TGT"]="C"
+    _T["GAC"]="D"; _T["GAT"]="D"
+    _T["GAA"]="E"; _T["GAG"]="E"
+    _T["TTC"]="F"; _T["TTT"]="F"
+    _T["GGA"]="G"; _T["GGC"]="G"; _T["GGG"]="G"; _T["GGT"]="G"; _T["GGN"]="G"; _T["GG"]="G"
+    _T["CAC"]="H"; _T["CAT"]="H"
+    _T["ATA"]="I"; _T["ATC"]="I"; _T["ATT"]="I"
+    _T["AAA"]="K"; _T["AAG"]="K"
+    _T["CTA"]="L"; _T["CTC"]="L"; _T["CTG"]="L"; _T["CTT"]="L"; _T["CTN"]="L"; _T["CT"]="L"; _T["TTA"]="L"; _T["TTG"]="L"
+    _T["ATG"]="M"
+    _T["AAC"]="N"; _T["AAT"]="N"
+    _T["CCA"]="P"; _T["CCC"]="P"; _T["CCG"]="P"; _T["CCT"]="P"; _T["CCN"]="P"; _T["CC"]="P"
+    _T["CAA"]="Q"; _T["CAG"]="Q"
+    _T["AGA"]="R"; _T["AGG"]="R"; _T["CGA"]="R"; _T["CGC"]="R"; _T["CGG"]="R"; _T["CGT"]="R"; _T["CGN"]="R"; _T["CG"]="R"
+    _T["AGC"]="S"; _T["AGT"]="S"; _T["TCA"]="S"; _T["TCC"]="S"; _T["TCG"]="S"; _T["TCT"]="S"; _T["TCN"]="S"; _T["TC"]="S"
+    _T["ACA"]="T"; _T["ACC"]="T"; _T["ACG"]="T"; _T["ACT"]="T"; _T["ACN"]="T"; _T["AC"]="T"
+    _T["GTA"]="V"; _T["GTC"]="V"; _T["GTG"]="V"; _T["GTT"]="V"; _T["GTN"]="V"; _T["GT"]="V"
+    _T["TGG"]="W"
+    _T["TAC"]="Y"; _T["TAT"]="Y"
+    _T["TAA"]="*"; _T["TAG"]="*"; _T["TGA"]="*"
+    __transeq_rc="RC"
+  }
+  function transeq(seq,frame,   l,res,i,a) {
+    seq=toupper(seq)
+    l=length(seq)
+    if (frame>3) {
+      print seq |& __transeq_rc
+      __transeq_rc |& getline seq
+      frame-=3
+    }
+    res=""
+    l=l-2+frame-1
+    for (i=frame;i<=l;i+=3) {
+      a=_T[substr(seq,i,3)]
+      res=res (a==""?"X":a)
+    }
+    return res
+  }
+  function transeq_all_frames_to_fasta(name,seq,   i) {
+    for (i=1;i<=6;++i)
+      print ">"name"_"i"\n"transeq(seq,i);
+    return
+  }
+'
+
 function wsplign {
   local QUERY=$(realpath "$1")
   local TARGET=$(realpath "$2")
@@ -461,34 +509,80 @@ function the_transporter_II {
       # We index the CDS products
       makeblastdb -dbtype prot -in CDS.prot.fasta -out CDS.prot > /dev/null 2>&1
       # We generate candidates from sufficiently large ORF fragments
-      cat TARGET.fasta | transeq -frame 6 /dev/stdin /dev/stdout 2> /dev/null | FASTools | awk -F '\t' -v MIN_PEP_LEN="$MIN_PEP_LEN" '{split($2,s,"[*]+"); l=length(s); for (i=1;i<=l;++i) if (length(s[i])>=MIN_PEP_LEN) print ">"$1"_"i"\n"s[i]}' | blastp -seg no -word_size 2 -evalue 100 -db CDS.prot -query /dev/stdin -num_threads "$THREADS" -outfmt "6 qseqid qlen qstart qend sallseqid slen sstart send pident evalue bitscore" | awk -F '\t' '{if (($4-$3)>0.4*$2) print $5}' | sort | uniq | awk -F ':' 'BEGIN{nucl="CANDIDATES.nucl.fasta"; prot="CANDIDATES.prot.fasta"; printf "" > nucl; printf "" > prot} {print ">"$1":"$2":"$3"\n"$4 >> nucl; print ">"$1":"$2":"$3"\n"$5 >> prot}'
+      cat TARGET.fasta | FASTools | awk -F '\t' -v MIN_PEP_LEN="$MIN_PEP_LEN" "$AWK_transeq"'
+        {
+          for (frame=1;frame<=6;++frame) {
+            split(transeq($2,frame),s,"[*]+")
+            l=length(s)
+            for (i=1;i<=l;++i)
+              if (length(s[i])>=MIN_PEP_LEN)
+                print ">"$1"_"i"\n"s[i];
+          }
+        }
+      ' | blastp -seg no -word_size 2 -evalue 100 -db CDS.prot -query /dev/stdin -num_threads "$THREADS" -outfmt "6 qseqid qlen qstart qend sallseqid slen sstart send pident evalue bitscore" | awk -F '\t' '{if (($4-$3)>0.4*$2) print $5}' | sort | uniq | awk -F ':' 'BEGIN{nucl="CANDIDATES.nucl.fasta"; prot="CANDIDATES.prot.fasta"; printf "" > nucl; printf "" > prot} {print ">"$1":"$2":"$3"\n"$4 >> nucl; print ">"$1":"$2":"$3"\n"$5 >> prot}'
       # We run splign on the DNA candidates
       wsplign CANDIDATES.nucl.fasta TARGET.fasta "$THREADS" | awk -F '\t' -v MIN_NUCL_SIM="$MIN_NUCL_SIM" -f <(echo "$AWK_library"'{len_new=metrics_to_length($2); len_old=metrics_to_length($4); if (abs(len_old-len_new)/max(len_old,len_new)<(1.-MIN_NUCL_SIM)&&$5>=MIN_NUCL_SIM) print "SPLIGN\t"$0}') > CANDIDATES.splign &
       # We run tblast on the protein candidates, and process its output
       tblastn -db TARGET -query CANDIDATES.prot.fasta -seg no -word_size 2 -max_intron_length "$MAX_INTRON_LENGTH" -num_threads "$THREADS" -outfmt "6 qseqid qlen qstart qend sallseqid slen sstart send pident evalue bitscore" | awk -F '\t' -v MAX_INTRON_LENGTH="$MAX_INTRON_LENGTH" -v MIN_NUCL_SIM="$MIN_NUCL_SIM" -v MIN_PROT_SIM="$MIN_PROT_SIM" 'function abs(x){return x<0?-x:x} {split($1,s,":"); split(s[3],ss,"+"); l=length(ss); min=MAX_INTRON_LENGTH; for (i=1;i<=l;++i) {split(ss[i],sss,"-"); dist=abs(sss[2]-sss[1])+1; min=(dist<min?dist:min)} if (abs($8-$7)>=MIN_NUCL_SIM*min&&$9>=100.*MIN_PROT_SIM) print $0"\t"($8>=$7?"+\t"$7"\t"$8:"-\t"$8"\t"$7)"\t["min"]"}' | sort -k12,12 -k13,13g -k14,14g | awk -F '\t' 'BEGIN{sort="sort -k11,11gr -k9,9gr"} function print_group(group,        line){if (group!="") {printf group |& sort; close(sort,"to"); sort |& getline line; close(sort); print line} return} BEGIN{group=""} {if ($12!=str||$13>hi) {print_group(group); group=$0"\n"; str=$12; lo=$13; hi=$14} else {group=group $0"\n"; if ($14>hi) hi=$14}  ">>>"$0"\n<<<===\n"group"===>>>["str","lo","hi"]"  } END{print_group(group)}' | sort -k1,1 -k12,12 -k7,7n -k8,8n | awk -F '\t' 'BEGIN{group=""} {if ($1!=current||$12!=strand) {if (group!="") printf group; current=$1; strand=$12; score=$10; group=$0"\n"} else {if ($10==score) group=group $0"\n"}} END{if (current!="") printf group}' | awk -F '\t' 'BEGIN {res=""} {if ($1!=current||$12!=strand) {if (res!="") print $5":"strand":"res"\t"current"\t"((sim+0.)/len/100.); current=$1; strand=$12; res=$13"-"$14; len=1+$14-$13; sim=$9*(1+$14-$13)} else {res=res (res==""?"":"+")$13"-"$14; len+=(1+$14-$13); sim+=$9*(1+$14-$13)}} END{if (res!="") print $5":"strand":"res"\t"current"\t"((sim+0.)/len/100.)}' | awk -F '\t' -f <(echo "$AWK_library"'{print $1"\t"compute_metrics($1)"\t"$2"\t"compute_metrics($2)"\t"$3}') | awk -F '\t' -v MIN_NUCL_SIM="$MIN_NUCL_SIM" -v MIN_PROT_SIM="$MIN_PROT_SIM" -f <(echo "$AWK_library"'{len_new=metrics_to_length($2); len_old=metrics_to_length($4); if (abs(len_old-len_new)/max(len_old,len_new)<(1.-MIN_NUCL_SIM)&&$5>=MIN_PROT_SIM) print "TBLASTN\t"$0}') > CANDIDATES.tblastn &
       # We generate, and search for, ORFs
-      (cat TARGET.fasta | transeq -frame 6 -alternative Y /dev/stdin /dev/stdout 2> /dev/null | FASTools | awk -F '\t' -v MIN_ORF_LEN="$MIN_ORF_LEN" 'function find_start_offset(s){return length(gensub("^([^M]*).*$","\\1",1,s))} function process_orf(orf,idx,name,seq_len,frame,      offs,ok){offs=find_start_offset(orf); ok=substr(orf,1+offs); ok=gensub("X$","",1,ok); if (length(ok)>=MIN_ORF_LEN) {  ">>>"(idx+offs)","seq_len","frame","length(ok)"<<<"substr($2,idx+offs,length(ok));  if (frame>3) {hi=seq_len-(frame-1)%3-3*(idx+offs-1); lo=hi+1-3*length(ok)} else {lo=1+(frame-1)%3+3*(idx+offs-1); hi=lo+3*length(ok)-1} print ">"name":"(frame>3?"-":"+")":"lo"-"hi"\n"ok >> "CANDIDATES.orfs.fasta"; print "ORFS\t"name":"(frame>3?"-":"+")":"lo"-"hi"\t"3*length(ok)"\t\t\t" >> "CANDIDATES.orfs"} return} BEGIN{printf "" > "CANDIDATES.orfs.fasta"; printf "" > "CANDIDATES.orfs"; while ("cat TARGET.fasta | FASTools" |& getline) t[$1]=length($2)} {split(gensub("^(.+)_([1-6])$","\\1\t\\2",1,$1),x,"\t"); seq_len=t[x[1]]; frame=x[2]; split($2,s,"[*]+",seps); l=length(s); if (l>0) {idx=1; process_orf(s[1],idx,x[1],seq_len,x[2]); for (i=2;i<=l;++i) {idx+=length(s[i-1])+length(seps[i-1]); process_orf(s[i],idx,x[1],seq_len,x[2])}}}'; cat CANDIDATES.orfs.fasta | blastp -seg no -word_size 2 -evalue 100 -db CDS.prot -query /dev/stdin -num_threads "$THREADS" -outfmt "6 qseqid qlen qstart qend sallseqid slen sstart send pident evalue bitscore" | awk -F '\t' '{if (($4-$3)/$2>0.4&&($8-$7)/$6>0.4&&$9>40) print}' | sort -t$'\t' -k1,1 -k11,11gr | awk -F '\t' '{if ($1!=curr_feature) {curr_feature=$1; curr_best_score=$11; print} else {if ($11==curr_best_score) print}}' | awk -F '\t' -f <(echo "$AWK_library"'{split($5,s,":"); loc=s[1]":"s[2]":"s[3]; print "BLASTP\t"$1"\t"compute_metrics($1)"\t"loc"\t"compute_metrics(loc)"\t"($9/100.)}') > CANDIDATES.blastp) &
+      (
+        cat TARGET.fasta | FASTools | awk -F '\t' -v MIN_ORF_LEN="$MIN_ORF_LEN" "$AWK_transeq"'
+          function find_start_offset(s) {
+            return length(gensub("^([^M]*).*$","\\1",1,s))
+          }
+          function process_orf(orf,idx,name,seq_len,frame,      offs,ok) {
+            offs=find_start_offset(orf)
+            ok=substr(orf,1+offs)
+            ok=gensub("X$","",1,ok)
+            if (length(ok)>=MIN_ORF_LEN) {
+              #print ">>>"(idx+offs)","seq_len","frame","length(ok)"<<<"substr($2,idx+offs,length(ok))
+              if (frame>3) {
+                hi=seq_len-(frame-1)%3-3*(idx+offs-1)
+                lo=hi+1-3*length(ok)
+              } else {
+                lo=1+(frame-1)%3+3*(idx+offs-1)
+                hi=lo+3*length(ok)-1
+              }
+              print ">"name":"(frame>3?"-":"+")":"lo"-"hi"\n"ok >> "CANDIDATES.orfs.fasta"
+              print "ORFS\t"name":"(frame>3?"-":"+")":"lo"-"hi"\t"3*length(ok)"\t\t\t" >> "CANDIDATES.orfs"
+            }
+            return
+          }
+          BEGIN {
+            printf "" > "CANDIDATES.orfs.fasta"
+            printf "" > "CANDIDATES.orfs"
+            while ("cat TARGET.fasta | FASTools" |& getline)
+              t[$1]=length($2);
+          }
+          {
+            seq_len=t[$1]
+            for (frame=1;frame<=6;++frame) {
+              l=split(transeq($2,frame),s,"[*]+",seps)
+              if (l>0) {
+                idx=1
+                process_orf(s[1],idx,$1,seq_len,frame)
+                for (i=2;i<=l;++i) {
+                  idx+=length(s[i-1])+length(seps[i-1])
+                  process_orf(s[i],idx,$1,seq_len,frame)
+                }
+              }
+            }
+          }
+        ';
+        cat CANDIDATES.orfs.fasta | blastp -seg no -word_size 2 -evalue 100 -db CDS.prot -query /dev/stdin -num_threads "$THREADS" -outfmt "6 qseqid qlen qstart qend sallseqid slen sstart send pident evalue bitscore" | awk -F '\t' '{if (($4-$3)/$2>0.4&&($8-$7)/$6>0.4&&$9>40) print}' | sort -t$'\t' -k1,1 -k11,11gr | awk -F '\t' '{if ($1!=curr_feature) {curr_feature=$1; curr_best_score=$11; print} else {if ($11==curr_best_score) print}}' | awk -F '\t' -f <(echo "$AWK_library"'{split($5,s,":"); loc=s[1]":"s[2]":"s[3]; print "BLASTP\t"$1"\t"compute_metrics($1)"\t"loc"\t"compute_metrics(loc)"\t"($9/100.)}') > CANDIDATES.blastp
+      ) &
       wait
       # We sort and uniquify results
       cat CANDIDATES.splign CANDIDATES.tblastn CANDIDATES.blastp CANDIDATES.orfs | awk -F '\t' -f <(echo "$AWK_library"'BEGIN{prio["SPLIGN"]=1; prio["TBLASTN"]=2; prio["BLASTP"]=3; prio["ORFS"]=4} {split($2,s,":"); split(s[3],ss,"[+-]"); print $0"\t"s[2]"\t"ss[1]"\t"ss[length(ss)]"\t"prio[$1]"\t"metrics_to_length($3)}') | sort -t$'\t' -k7,7 -k8,8n -k9,9n | awk -F '\t' '{split($2,s,":"); print s[1]"\t"s[2]"\t"s[3]"\t"$0}' |
-      awk -F '\t' -v TARGET_LEN="$(cat TARGET.fasta | FASTools | awk -F '\t' '{print length($2)}')" -v TARGET="$TARGET" "$AWK_library $AWK_retriever"'
+      awk -F '\t' -v TARGET_LEN="$(cat TARGET.fasta | FASTools | awk -F '\t' '{print length($2)}')" -v TARGET="$TARGET" "$AWK_library $AWK_retriever $AWK_transeq"'
         BEGIN {
-          transeq="transeq -frame F /dev/stdin /dev/stdout 2> /dev/null | FASTools | awk -F \047\\t\047 \047{print $2}\047"
           delete translation
         }
         #
-        function get_translation(s,     frame_1,frame_2,frame_3) {
-          close(transeq)
-          print ">Query\n"s |& transeq
-          close(transeq,"to")
-          transeq |& getline frame_1
-          transeq |& getline frame_2
-          transeq |& getline frame_3
-          close(transeq)
+        function get_translations(s,   i) {
           delete translation
-          translation[1]=frame_1
-          translation[2]=frame_2
-          translation[3]=frame_3
+          for (i=1;i<=3;++i)
+            translation[i]=transeq(s,i);
           return
         }
         #
@@ -533,7 +627,7 @@ function the_transporter_II {
             lo=nucl_len-old_hi+1
             hi=nucl_len-old_lo+1
           }
-          get_translation(ext_seq)
+          get_translations(ext_seq)
           actual_frame=1+(lo-1)%3
           ###
           if (VERBOSE!="")
@@ -986,19 +1080,13 @@ function internal_add_sequence {
       if ($4~REGEXP)
         print $1"\t"$2"\t"$3"\t"$4"\t"$5($5==""?"":",")"dna=\""retrieve_location("",$1,$2,$3)"\""
     }
-    ' | awk -F '\t' "$AWK_library"'
+  ' | awk -F '\t' "$AWK_library $AWK_transeq"'
     BEGIN {
       OFS="\t"
     }
     #
     {
-      transeq="transeq /dev/stdin /dev/stdout 2> /dev/null | FASTools"
-      print get_value("dna",$5) |& transeq
-      close(transeq,"to")
-      transeq |& getline line
-      close(transeq)
-      split(line,s,"\t")
-      prot=gensub("*$","",1,s[2])
+      prot=gensub("*$","",1,transeq(get_value("dna",$5),1))
       if ($5~"(^|,)translation=") {
         orig=get_value("translation",$5)
         if (prot!=orig) {

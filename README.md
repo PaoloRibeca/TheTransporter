@@ -10,11 +10,10 @@ Bug reports are always appreciated. Please send them to [paolo.ribeca@gmail.com]
 
 The Transporter depends on:
 * Standard UNIX toolchain utilities (`bash`, `AWK`, etc.)
-* A few programs from [BiOCamLib](https://github.com/PaoloRibeca/BiOCamLib). Installation instructions can be found there, but the process is usually very simple and you can just copy pre-compiled binaries across
-* Program `transeq` from the EMBOSS suite. EMBOSS can be installed through `conda` or compiled from scratch after downloading it from [here](https://emboss.sourceforge.net/download/). Compilation is straightforward (`./configure` and `make`)
+* A few programs from [BiOCamLib](https://github.com/PaoloRibeca/BiOCamLib). Installation instructions can be found there, but the process is usually very simple and you can just copy pre-compiled binaries across. Alternatively, the `BiOCamLib` binaries are provided in directory [`Dependencies`](Dependencies)
 * Depending on the annotation method you'd like to use, external programs such as BLAST, Splign, ...
 
-Unfortunately, Splign is notoriously difficult to compile. In order to simplify installation, static binaries pre-compiled for Linux and independent of the kernel version are provided in directory [`Dependencies`](Dependencies) for Splign and all other dependencies. Just copy them to some place in your PATH, and you won't need to install anything else.
+Unfortunately, Splign is notoriously difficult to compile. In order to simplify installation, static binaries pre-compiled for Linux and independent of the kernel version are provided in directory [`Dependencies`](Dependencies) for Splign and all other dependencies. Just copy them to some place in your PATH, and ideally you won't need to install anything else.
 
 ## Examples of use
 
