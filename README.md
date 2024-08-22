@@ -2,7 +2,7 @@
 
 The Transporter is a small suite of utility programs to transfer a set of annotated features from one genome to a (possibly not that) closely related one. It was initially written as a re-implementation of a tool in the spirit of GATU and others, but it evenutally morphed into something a bit different. Typical use cases are viral or bacterial genomes, although there is no real reason why things shouldn't scale up to larger genomes &mdash; but beware, we never really tested the method on those, so you are on your own if you want to go there... 
 
-> The Transporter is currently unpublished. **You are welcome to use it, but you must not redistribute it**.
+A manuscript explaining the techniques we use is in preparation.
 
 Bug reports are always appreciated. Please send them to [paolo.ribeca@gmail.com](mailto:paolo.ribeca@gmail.com). Thank you.
 
