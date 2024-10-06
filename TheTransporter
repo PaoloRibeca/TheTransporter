@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #
-# (C) 2018-2023 Paolo Ribeca, <paolo.ribeca@gmail.com>
+# (C) 2018-2024 Paolo Ribeca, <paolo.ribeca@gmail.com>
 #  This script transports the annotation for a reference genome
 #   to another (hopefully close) genome
 #
@@ -33,12 +33,12 @@
 set -e
 
 # TODO:
-#  * Score !=0 when number of exons different from the starting one 
+#  * Score !=0 when number of exons different from the starting one
 #  * Add support for "escaped" "" in fields
 #  * Reject unsupported syntax for coordinates
 #  * Option to exclude features mapped to the opposite strand?
 
-VERSION="27"
+VERSION="28"
 
 LEFT_ALIGNED_FEATURES="note|inference|experiment"
 GB_COLS=79
@@ -107,8 +107,7 @@ AWK_library='
   #
   function compute_metrics(feat,        x,s,l,res,i,ss) {
     split(feat,x,":")
-    split(x[3],s,"+")
-    l=length(s)
+    l=split(x[3],s,"+")
     res=""
     for (i=1;i<=l;++i) {
       split(s[i],ss,"-")
@@ -117,8 +116,7 @@ AWK_library='
     return res
   }
   function metrics_to_length(m,      s,l,res,i) {
-    split(m,s,"+")
-    l=length(s)
+    l=split(m,s,"+")
     res=0
     for (i=1;i<=l;++i)
       res+=s[i];
@@ -133,8 +131,7 @@ AWK_library='
   }
   function left_aligned_output(s,blks,cols,    ss,llen,line,res,ii,ext) {
     s=gensub("[ ]+"," ","g",s)
-    split(s,ss," ")
-    llen=length(ss)
+    llen=split(s,ss," ")
     line=""
     res=""
     ### The invariant is that length(line)<cols ###
@@ -307,8 +304,7 @@ AWK_retriever='
     # Nothing happens if the sequence has already been loaded
     retriever_load(file)
     # There might be "<"s or ">"s in the location, to signify incomplete features
-    split(gensub("[<>]","","g",loc),s,"+")
-    len=length(s)
+    len=split(gensub("[<>]","","g",loc),s,"+")
     res=""
     for (i=1;i<=len;++i) {
       split(s[i],ss,"-")
@@ -397,9 +393,8 @@ function wsplign {
       echo "$AWK_library"
 cat <<'_____'
       function score(a1,a2,    va1,va2,len,res,i) {
-        split(a1,va1,"+")
+        len=split(a1,va1,"+")
         split(a2,va2,"+")
-        len=length(va1)
         if (length(va2)!=len) # Different number of exons/alignment blocks
           return 0;
         res=0
@@ -438,8 +433,7 @@ cat <<'_____'
             # Both the query and the reference might have been swapped
             str_trg=str[($7>$6?"+":"-")($9>$8?"+":"-")]
             # There could be "<"s or ">"s in the location, to signify incomplete features
-            split(gensub("[<>]","","g",s[3]),ss,"+")
-            len=length(ss)
+            len=split(gensub("[<>]","","g",s[3]),ss,"+")
             aln_que=""
             for (i=1;i<=len;++i) {
               split(ss[i],sss,"-")
@@ -483,7 +477,7 @@ function the_transporter_II {
   local MIN_ORF_LEN=60 # Minimum length of products of de-novo ORFs
   local MIN_NUCL_SIM=0.7
   local MIN_PROT_SIM=0.4
-  local MIN_OVERL_THR=0.9 # Minimum length ratio to call containment 
+  local MIN_OVERL_THR=0.9 # Minimum length ratio to call containment
   #
   local MAX_INTRON_LENGTH=500000
   #
@@ -512,8 +506,7 @@ function the_transporter_II {
       cat TARGET.fasta | FASTools | awk -F '\t' -v MIN_PEP_LEN="$MIN_PEP_LEN" "$AWK_transeq"'
         {
           for (frame=1;frame<=6;++frame) {
-            split(transeq($2,frame),s,"[*]+")
-            l=length(s)
+            l=split(transeq($2,frame),s,"[*]+")
             for (i=1;i<=l;++i)
               if (length(s[i])>=MIN_PEP_LEN)
                 print ">"$1"_"i"\n"s[i];
@@ -553,8 +546,7 @@ function the_transporter_II {
         awk -F '\t' -v MAX_INTRON_LENGTH="$MAX_INTRON_LENGTH" -v MIN_NUCL_SIM="$MIN_NUCL_SIM" -v MIN_PROT_SIM="$MIN_PROT_SIM" "$AWK_library"'
           {
             split($1,s,":")
-            split(s[3],ss,"+")
-            l=length(ss)
+            l=split(s[3],ss,"+")
             m=MAX_INTRON_LENGTH
             for (i=1;i<=l;++i) {
               split(ss[i],sss,"-")
@@ -716,7 +708,8 @@ function the_transporter_II {
               if ($11==curr_best_score)
                 print;
             }
-          }' | awk -F '\t' "$AWK_library"'
+          }
+        ' | awk -F '\t' "$AWK_library"'
           {
             split($5,s,":")
             loc=s[1]":"s[2]":"s[3]
@@ -921,7 +914,7 @@ function the_transporter_II {
             for (i=4;i<=NF;++i)
               printf "\t"$i;
             printf "\n"
-          } 
+          }
           # As there is no well-formed ORF, we drop the CDS
         }
       ' | awk -F '\t' "$AWK_library"'
@@ -1109,8 +1102,7 @@ function the_transporter_II {
         #  (5) optionally remove DNA sequences from CDSs
         {
           if ($3 in t) {
-            split(t[$3],s,"\n");
-            len=length(s);
+            len=split(t[$3],s,"\n");
             for (i=1;i<=len;++i) {
               split(s[i],ss,"\t");
               if (ss[1]=="CDS") {
@@ -1344,8 +1336,8 @@ function features_2_genbank {
 function features_2_gff3 {
   awk '{if ($0!~"^[#=<>%]"&&$4!="source") print}' | awk -F '\t' -v ACC="$TGT_ACC" "$AWK_library"'
     {
-      
-      ### TODO    
+
+      ### TODO
       ### TODO
       ### TODO
 
@@ -1523,7 +1515,7 @@ Syntax:
       do not erase temporary files
         (default=erase)
     [-h|--help]
-      print this syntax and exit.    
+      print this syntax and exit.
 _____
 }
 
