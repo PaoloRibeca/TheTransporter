@@ -1244,23 +1244,27 @@ function internal_add_sequence {
   awk -F '\t' -v REGEXP="$1" "$AWK_retriever"'
     {
       if ($4~REGEXP)
-        print $1"\t"$2"\t"$3"\t"$4"\t"$5($5==""?"":",")"dna=\""retrieve_location("",$1,$2,$3)"\""
+        print $1"\t"$2"\t"$3"\t"$4"\t"$5($5==""?"":",")"dna=\""retrieve_location("",$1,$2,$3)"\"";
+      else
+        print
     }
-  ' | awk -F '\t' "$AWK_library $AWK_transeq"'
+  ' | awk -F '\t' -v REGEXP="$1" "$AWK_library $AWK_transeq"'
     BEGIN {
       OFS="\t"
     }
     #
     {
-      prot=gensub("*$","",1,transeq(get_value("dna",$5),1))
-      if ($5~"(^|,)translation=") {
-        orig=get_value("translation",$5)
-        if (prot!=orig) {
-          print "ERROR: Mismatch between annotated protein \047"orig"\047 and translated protein \047"prot"\047, changing to translated" > "/dev/stderr"
-          $5=set_value("translation",prot)
-        }
-      } else
-        $5=$5",translation=\""prot"\"";
+      if ($4~REGEXP) {
+        prot=gensub("*$","",1,transeq(get_value("dna",$5),1))
+        if ($5~"(^|,)translation=") {
+          orig=get_value("translation",$5)
+          if (prot!=orig) {
+            print "ERROR: On line \047"$0"\047: Mismatch between annotated protein \047"orig"\047 and translated protein \047"prot"\047, changing to translated" > "/dev/stderr"
+            $5=set_value("translation",prot)
+          }
+        } else
+          $5=$5",translation=\""prot"\"";
+      }
       print
     }
   '
@@ -1718,7 +1722,7 @@ case "$FMT_IN" in
     cat "$IN" | sed 's/\r$//' | genbank_2_sequence > "$TMP_DIR/$REF_LOC".fasta
     cat "$IN" | sed 's/\r$//' | genbank_2_features | (
       cd "$TMP_DIR"
-      internal_add_sequence "."
+      internal_add_sequence "^CDS$"
     ) > "$TMP_PREFIX".int
     cat "$TGT" | sed 's/\r$//' > "$TMP_PREFIX".tgt.fa
     ;;
@@ -1907,7 +1911,7 @@ cat "$TMP_PREFIX".res | awk -v INIT="$TMP_PREFIX".int -F '\t' '
   }
 ' | sort -k2,2 -k1,1n -k3,3 | awk -F '\t' '{print $2"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7}' > "$TMP_PREFIX".sum
 
-# Converting internal representation to output format
+# Convert internal representation to output format
 
 case "$FMT_OUT" in
   gb )
@@ -1925,6 +1929,10 @@ case "$FMT_OUT" in
     cat "$TMP_PREFIX".tgt.fa | sequence_2_gff3 >> "$OUT"
     ;;
 esac
+
+# Copy summary file
+
+cp "$TMP_PREFIX".sum "$OUT".sum
 
 # Emit final summary
 
