@@ -38,7 +38,7 @@ set -e
 #  * Reject unsupported syntax for coordinates
 #  * Option to exclude features mapped to the opposite strand?
 
-VERSION="28"
+VERSION="30"
 
 LEFT_ALIGNED_FEATURES="note|inference|experiment"
 GB_COLS=79
@@ -129,32 +129,30 @@ AWK_library='
       res=res" ";
     return res
   }
-  function left_aligned_output(s,blks,cols,    ss,llen,line,res,ii,ext) {
-    s=gensub("[ ]+"," ","g",s)
-    llen=split(s,ss," ")
-    line=""
-    res=""
-    ### The invariant is that length(line)<cols ###
-    for (ii=1;ii<=llen;++ii) {
-      ext=line (line==""?"":" ")ss[ii] # Space between two words - not at the beginning of the line though
-      if (length(ext)>=cols) {
-        # We always print something
-        if (line!="") { ### && length(line)<cols ###
-          res=res blks line"\n"
-          line=ss[ii]
-        } else {
-          # Here we have to split the word
-          while (length(ext)>=cols) {
-            res=res blks substr(ext,1,cols)"\n"
-            ext=substr(ext,cols+1)
+  function left_aligned_output(s,splitter,header,cols,    blks,n,ss,res,rem,i,to_be_written) {
+    # We assume the first line already has a margin
+    blks=blanks(length(header))
+    n=split(s,ss,splitter)
+    res=header
+    rem=cols
+    for (i=1;i<=n;++i) {
+      to_be_written=ss[i](i==n?"":splitter)
+      # The invariant is that (length(to_be_written)<=rem)
+      if (length(to_be_written)>rem) {
+        res=res"\n"blks
+        rem=cols
+        if (length(to_be_written)>cols)
+          # Here the only solution is to split
+	  while (length(to_be_written)>cols) {
+            res=res substr(to_be_written,1,cols)"\n"blks
+	    to_be_written=substr(to_be_written,cols+1)
           }
-          line=ext
-        }
-      } else
-        line=ext;
+        # At this point 1<length(to_be_written)<=(rem==cols)
+      }
+      res=res to_be_written
+      rem-=length(to_be_written)
     }
-    # Append what is left ### length(line) < cols ###
-    res=res blks line"\n"
+    res=res"\n"
     return res
   }
 '
@@ -1280,7 +1278,7 @@ awk -v COLS="$GB_COLS" -v LEN="$TGT_LEN" -v LOC="$TGT_LOC" -v CLA="$TGT_CLA" -v 
     print "KEYWORDS    "KEY
     print "SOURCE      "SOU
     print "  ORGANISM  "ORG
-    printf("%s",left_aligned_output(LIN,blanks(12),max(1,COLS-12)))
+    printf("%s",left_aligned_output(LIN," ",blanks(12),max(1,COLS-12)))
   }
 '
 }
@@ -1309,10 +1307,14 @@ function features_2_genbank {
         loc="join("loc")";
       if ($2=="-")
         loc="complement("loc")";
-      print "     "$4 blanks(max(1,16-length($4)))loc
+      # The location might overflow. We split it at commas to be more readable
+      #  (not entirely sure if this is really compliant though).
+      # We assume that this is always going to work, as even with very long genomes
+      #  the only reason why the location might overflow is due to splicing
+      printf("%s",left_aligned_output(loc,",","     "$4 blanks(max(1,16-length($4))),cols))
       # We can split at `",` because we are sure that each value is always double quoted.
       # However, while doing so, we eliminate the trailing `"` from each value
-      # We eliminate some features that are not meant for GenBank
+      # We also eliminate some features that are not meant for GenBank
       features=delete_key("method",delete_key("score",$5))
       n=split(substr(features,1,length(features)-1),s,"\",")
       for (i=1;i<=n;++i) {
@@ -1324,7 +1326,7 @@ function features_2_genbank {
         if (rem~"^//")
           rem=gensub("^//([^=]+)=\"([^\"]+)\"$","/\\1=\\2",1,rem);
         if (s[i]~"^("LEFT_ALIGNED_FEATURES")=")
-          printf("%s",left_aligned_output(rem,blanks(21),cols));
+          printf("%s",left_aligned_output(rem," ",blanks(21),cols));
         else {
           while (length(rem)>cols) {
             print "                     "substr(rem,1,cols)
@@ -1541,7 +1543,7 @@ function add_binary_transformation {
 }
 
 echo "This is TheTransporter (version $VERSION)"
-echo " (c) 2018-2023 Paolo Ribeca, <paolo.ribeca@gmail.com>"
+echo " (c) 2018-2024 Paolo Ribeca, <paolo.ribeca@gmail.com>"
 
 # Parse command line options
 
