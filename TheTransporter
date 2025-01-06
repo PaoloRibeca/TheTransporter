@@ -38,7 +38,7 @@ set -e
 #  * Reject unsupported syntax for coordinates
 #  * Option to exclude features mapped to the opposite strand?
 
-VERSION="30"
+VERSION="31"
 
 LEFT_ALIGNED_FEATURES="note|inference|experiment"
 GB_COLS=79
@@ -70,7 +70,7 @@ TGT_GI=""
 TGT_LEN=0
 TRANSFORMATIONS=""
 THREADS=$(nproc)
-PRODUCTION=0
+DEBUG=""
 KEEP_TEMPORARIES=""
 VERBOSE=""
 
@@ -464,7 +464,8 @@ _____
 function the_transporter_II {
   local TARGET=$(realpath "$1")
   local DB=$(realpath "$2")
-  local THREADS="$3"
+  local DEBUG="$3"
+  local THREADS="$4"
   if [[ "$THREADS" == "" ]]; then
     THREADS=32
   fi
@@ -1072,7 +1073,7 @@ function the_transporter_II {
       # We select features that have been transported
       cat "$DB" | awk -F '\t' 'BEGIN{while (getline < "CANDIDATES.res") {if ($3!="") t[$3]}} {if ($1":"$2":"$3 in t) print}' > CANDIDATES.txt
       # We convert results to internal format
-      cat CANDIDATES.res | awk -F '\t' -v MIN_ORF_LEN="$MIN_ORF_LEN" -v TARGET_SEQ="$(cat TARGET.fasta | FASTools | awk -F '\t' '{print $1}')" -v TARGET_LEN="$(cat TARGET.fasta | FASTools | awk -F '\t' '{print length($2)}')" "$AWK_library $AWK_retriever"'
+      cat CANDIDATES.res | awk -F '\t' -v MIN_ORF_LEN="$MIN_ORF_LEN" -v TARGET_SEQ="$(cat TARGET.fasta | FASTools | awk -F '\t' '{print $1}')" -v TARGET_LEN="$(cat TARGET.fasta | FASTools | awk -F '\t' '{print length($2)}')" -v DEBUG="$DEBUG" "$AWK_library $AWK_retriever"'
         function get_support(loc,    s,ss) {
           split(loc,s,":")
           split(s[3],ss,"[+-]")
@@ -1511,8 +1512,8 @@ Syntax:
           "date", "definition", "source", "organism",
           "lineage", "taxonomy_id", "strain", "keywords",
           "locus", "accession", "version", "gi_number")
-    [-p|--production]
-      do not emit "/transl_orig" and "/dna" annotation
+    [-d|--debug]
+      emit "/transl_orig" and "/dna" annotations
         used to check correctness of CDS features
     [-T <threads>]
       computing threads
@@ -1543,11 +1544,11 @@ function add_binary_transformation {
 }
 
 echo "This is TheTransporter (version $VERSION)"
-echo " (c) 2018-2024 Paolo Ribeca, <paolo.ribeca@gmail.com>"
+echo " (c) 2018-2025 Paolo Ribeca, <paolo.ribeca@gmail.com>"
 
 # Parse command line options
 
-OPTS=$(getopt -o a:r:f:t:s:N:C:R:D:o:m:pT:kh --long gb,gtf,gff3,production,keep-temporaries,help -- "$@")
+OPTS=$(getopt -o a:r:f:t:s:N:C:R:D:o:m:dT:kh --long gb,gtf,gff3,debug,keep-temporaries,help -- "$@")
 
 # Check the result of parsing options was correct
 
@@ -1674,8 +1675,8 @@ while true; do
     --gff3 )
       FMT="gff3"
       ;;
-    -p | --production )
-      PRODUCTION=1
+    -d | --debug )
+      DEBUG=1
       ;;
     -T )
       THREADS=$(echo "$2" | awk '{t=int($0); print (t<1?"'"$THREADS"'":$0)}')
@@ -1878,7 +1879,7 @@ echo -e "$TGT_NAME\t+\t1-$TGT_LEN\tsource\torganism=\"$TGT_ORG\",mol_type=\"$TGT
 
 (
   cd "$TMP_DIR"
-  the_transporter_II TheTransporter.tgt.fa TheTransporter.int >> TheTransporter.res
+  the_transporter_II TheTransporter.tgt.fa TheTransporter.int "$DEBUG" "$THREADS" >> TheTransporter.res
 )
 
 # Generate list of failed transports
