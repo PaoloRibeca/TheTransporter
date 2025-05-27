@@ -26,3 +26,16 @@ $ TheTransporter -t Test/ASFV_de_novo.fasta -a Test/ASFV_Cameroon_2016.gbk -o Te
 ```
 This will generate an output `Test.gb` in GenBank format (which is the default).
 
+## Methods
+
+Each feature appearing in the output annotation file will contain a note summarising how it was generated, for instance
+```
+transported from KJ705001:-:8687-9763+9874-10092 (method=protein->DNA, similarity=0.72)
+```
+A quick correspondence table between the method name and the program actually used to generate the feature is as follows:
+Method name in the feature | Program
+---------------------------|--------
+RNA->DNA                   | `splign`
+protein->DNA               | `tblastn`
+protein->ORF               | `blastp`
+ORF                        | `transeq`
