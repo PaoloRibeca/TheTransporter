@@ -387,9 +387,7 @@ function wsplign {
     blastn -dust no -word_size 10 -db fasta/TARGET.fasta -query fasta/QUERY.fasta -num_threads "$THREADS" -outfmt 6 > HITS.reg-blast &
     wait
     cat HITS.dc-mblast HITS.short-blast HITS.reg-blast | sort -k2,2 -k1,1 > HITS.blastn
-    splign -type mrna -disc -W 10 -ldsdir fasta -hits HITS.blastn | awk -F '\t' -v NAMES=QUERY.names -f <(
-      echo "$AWK_library"
-cat <<'_____'
+    splign -type mrna -disc -W 10 -ldsdir fasta -hits HITS.blastn | awk -F '\t' -v NAMES=QUERY.names "$AWK_library"'
       function score(a1,a2,    va1,va2,len,res,i) {
         len=split(a1,va1,"+")
         split(a2,va2,"+")
@@ -454,8 +452,7 @@ cat <<'_____'
       END {
         output()
       }
-_____
-    ) | awk -F '\t' '{print $3"\t"$4"\t"$1"\t"$2"\t"$5}'
+    ' | awk -F '\t' '{print $3"\t"$4"\t"$1"\t"$2"\t"$5}'
     cd ..
     rm -rf "$OUT_DIR"
   fi
